@@ -37,6 +37,9 @@ let mac_to_ip = {};
 let prev_conns = {};
 // Recent DPI flow metadata from netifyd: key -> { host, app, proto, encrypted, risks, subject_dn, ts }
 let dpi_flows = {};
+// Learned IP -> Hostname mapping from mihomo DNS/sniff & netifyd TLS certificates
+let ip_to_domain = {};
+let subnet24_to_group = {};
 let netify_connected = false;
 let netify_flow_count = 0;
 
@@ -159,89 +162,211 @@ function get_device_info(ip) {
 
 // Destination Service Classification & Heuristic Rules
 const SERVICE_GROUPS = {
-	"wechat":     { id: "wechat",     name: "微信",       badge: "微", order: 1 },
-	"tencent":    { id: "tencent",    name: "Tencent",    badge: "T",  order: 2 },
-	"lark":       { id: "lark",       name: "Lark",       badge: "L",  order: 3 },
-	"feishu":     { id: "feishu",     name: "Feishu",     badge: "F",  order: 4 },
-	"apple":      { id: "apple",      name: "Apple 服务", badge: "A",  order: 5 },
-	"cloudflare": { id: "cloudflare", name: "Cloudflare", badge: "C",  order: 6 },
-	"openai":     { id: "openai",     name: "OpenAI",     badge: "O",  order: 7 },
-	"google":     { id: "google",     name: "Google",     badge: "G",  order: 8 },
-	"alibaba":    { id: "alibaba",    name: "Alibaba",    badge: "阿", order: 9 },
-	"cmschina":   { id: "cmschina",   name: "招商证券",   badge: "招", order: 10 },
-	"huawei":     { id: "huawei",     name: "华为云服务", badge: "华", order: 11 },
-	"github":     { id: "github",     name: "GitHub",     badge: "GH", order: 12 },
-	"twitter":    { id: "twitter",    name: "X / Twitter",badge: "X",  order: 13 },
-	"unknown":    { id: "unknown",    name: "未识别",     badge: "?",  order: 99 }
+	"wechat":     { id: "wechat",     name: "微信",         badge: "微", order: 1 },
+	"tencent":    { id: "tencent",    name: "Tencent",      badge: "T",  order: 2 },
+	"lark":       { id: "lark",       name: "Lark",         badge: "L",  order: 3 },
+	"feishu":     { id: "feishu",     name: "Feishu / 字节", badge: "F",  order: 4 },
+	"apple":      { id: "apple",      name: "Apple 服务",   badge: "A",  order: 5 },
+	"cloudflare": { id: "cloudflare", name: "Cloudflare",   badge: "C",  order: 6 },
+	"openai":     { id: "openai",     name: "AI 服务",      badge: "AI", order: 7 },
+	"google":     { id: "google",     name: "Google",       badge: "G",  order: 8 },
+	"alibaba":    { id: "alibaba",    name: "Alibaba",      badge: "阿", order: 9 },
+	"jd":         { id: "jd",         name: "京东 JD",      badge: "京", order: 10 },
+	"cmschina":   { id: "cmschina",   name: "招商证券/行情", badge: "招", order: 11 },
+	"huawei":     { id: "huawei",     name: "华为云服务",   badge: "华", order: 12 },
+	"sogou":      { id: "sogou",      name: "搜狗/输入法",  badge: "搜", order: 13 },
+	"github":     { id: "github",     name: "GitHub / CDN", badge: "GH", order: 14 },
+	"twitter":    { id: "twitter",    name: "X / Twitter",  badge: "X",  order: 15 },
+	"unknown":    { id: "unknown",    name: "未识别",       badge: "?",  order: 99 }
 };
 
-function classify_host(host, dpi_app) {
+// Detect proxy/tunnel server IPs from /etc/mihomo/config.yaml so router tunnel traffic is not confused with unknown LAN destinations
+let proxy_server_ips = {
+	"168.138.193.11": true,
+	"168.138.203.133": true,
+	"47.243.17.211": true,
+	"100.100.2.15": true
+};
+let mh_cfg = fs.readfile("/etc/mihomo/config.yaml") || "";
+for (let line in split(mh_cfg, "\n")) {
+	let m = match(line, /server:\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/);
+	if (m) proxy_server_ips[m[1]] = true;
+}
+
+function get_subnet24(ip) {
+	if (!ip) return "";
+	let p = split(ip, ".");
+	if (length(p) != 4) return "";
+	return p[0] + "." + p[1] + "." + p[2] + ".";
+}
+
+function learn_ip_domain(ip, domain, gid) {
+	if (!ip || !domain || ip == domain) return;
+	if (substr(ip, 0, 7) == "198.18." || substr(ip, 0, 8) == "127.0.0." || proxy_server_ips[ip]) return;
+	// Only learn if domain is not a raw IP
+	if (!match(domain, /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/)) {
+		ip_to_domain[ip] = domain;
+		let s24 = get_subnet24(ip);
+		if (s24 != "" && gid && gid != "unknown") {
+			subnet24_to_group[s24] = { group_id: gid, sample_domain: domain };
+		}
+	}
+}
+
+function classify_host(host, dpi_app, dst_port) {
 	let h = lc(host || "");
 	let app = lc(dpi_app || "");
+	let port = int(dst_port || 0);
 
-	// Check WeChat first (including wxkb-* WeChat Keyboard & weixin)
-	if (index(h, "weixin.qq.com") >= 0 || index(h, "wechat.com") >= 0 || index(h, "wx.qq.com") >= 0 ||
-	    index(h, "wxkb-") >= 0 || index(h, "tenpay.com") >= 0 || index(h, "servicewechat.com") >= 0 ||
-	    index(h, "qlogo.cn") >= 0 || index(app, "wechat") >= 0 || index(app, "weixin") >= 0) {
+	// 1. WeChat (including wxkb-*, weixin.com, qpic.cn, qlogo.cn, and WeChat direct IP ranges)
+	if (index(h, "weixin.qq.com") >= 0 || index(h, "weixin.com") >= 0 || index(h, "wechat.com") >= 0 ||
+	    index(h, "wx.qq.com") >= 0 || index(h, "wxkb-") >= 0 || index(h, "tenpay.com") >= 0 ||
+	    index(h, "servicewechat.com") >= 0 || index(h, "qlogo.cn") >= 0 || index(h, "qpic.cn") >= 0 ||
+	    index(app, "wechat") >= 0 || index(app, "weixin") >= 0 ||
+	    substr(h, 0, 11) == "119.147.19." || substr(h, 0, 8) == "157.148." || substr(h, 0, 8) == "157.255." || substr(h, 0, 7) == "183.60.") {
 		return "wechat";
 	}
+
+	// 2. Sogou / Input Method / Baidu
+	if (index(h, "sogou.com") >= 0 || index(h, "sogo.com") >= 0 || index(h, "iflytek.com") >= 0 ||
+	    index(h, "baiduinput") >= 0 || index(h, "baidu.com") >= 0 || index(app, "baidu") >= 0) {
+		return "sogou";
+	}
+
+	// 3. Tencent
 	if (index(h, "myqcloud.com") >= 0 || index(h, "qq.com") >= 0 || index(h, "gtimg.com") >= 0 ||
-	    index(h, "tencent.com") >= 0 || index(h, "qcloud.com") >= 0 || h == "120.53.53.53" || index(app, "tencent") >= 0 || index(app, "qq") >= 0) {
+	    index(h, "tencent.com") >= 0 || index(h, "qcloud.com") >= 0 || index(h, "doh.pub") >= 0 ||
+	    h == "120.53.53.53" || h == "1.12.12.12" || substr(h, 0, 7) == "14.153." ||
+	    substr(h, 0, 7) == "58.251." || substr(h, 0, 7) == "43.140." ||
+	    index(app, "tencent") >= 0 || index(app, "qq") >= 0) {
 		return "tencent";
 	}
+
+	// 4. Lark & Feishu / ByteDance
 	if (index(h, "larksuite.com") >= 0 || index(h, "larkoffice.com") >= 0) {
 		return "lark";
 	}
 	if (index(h, "feishu.cn") >= 0 || index(h, "feishucdn.com") >= 0 || index(h, "bytedance.com") >= 0 ||
-	    index(h, "byteimg.com") >= 0 || index(h, "snssdk.com") >= 0 || index(h, "douyin.com") >= 0) {
+	    index(h, "byteimg.com") >= 0 || index(h, "snssdk.com") >= 0 || index(h, "douyin.com") >= 0 ||
+	    index(h, "doubao.com") >= 0 || index(h, "volces.com") >= 0 || index(h, "zijieapi.com") >= 0) {
 		return "feishu";
 	}
+
+	// 5. Apple
 	if (index(h, "apple.com") >= 0 || index(h, "icloud.com") >= 0 || index(h, "mzstatic.com") >= 0 ||
-	    index(h, "cdn-apple.com") >= 0 || index(h, "aaplimg.com") >= 0 || index(app, "apple") >= 0 || index(app, "icloud") >= 0) {
+	    index(h, "cdn-apple.com") >= 0 || index(h, "aaplimg.com") >= 0 ||
+	    index(app, "apple") >= 0 || index(app, "icloud") >= 0) {
 		return "apple";
 	}
-	if (index(h, "cloudflare.com") >= 0 || index(h, "cloudflare-dns.com") >= 0 || h == "1.1.1.1" || h == "1.0.0.1" || index(app, "cloudflare") >= 0) {
+
+	// 6. Cloudflare & NTP
+	if (index(h, "cloudflare.com") >= 0 || index(h, "cloudflare-dns.com") >= 0 ||
+	    h == "1.1.1.1" || h == "1.0.0.1" || substr(h, 0, 12) == "162.159.200." ||
+	    index(app, "cloudflare") >= 0) {
 		return "cloudflare";
 	}
-	if (index(h, "chatgpt.com") >= 0 || index(h, "openai.com") >= 0 || index(h, "oaistatic.com") >= 0 || index(h, "oaiusercontent.com") >= 0) {
+
+	// 7. AI Services (OpenAI, DeepSeek, Grok, OpenRouter, Claude, OpenCode, Raycast, etc.)
+	if (index(h, "chatgpt.com") >= 0 || index(h, "openai.com") >= 0 || index(h, "oaistatic.com") >= 0 ||
+	    index(h, "oaiusercontent.com") >= 0 || index(h, "openrouter.ai") >= 0 || index(h, "deepseek.com") >= 0 ||
+	    index(h, "grok.com") >= 0 || index(h, "anthropic.com") >= 0 || index(h, "claude.ai") >= 0 ||
+	    index(h, "opencode.ai") >= 0 || index(h, "muse.ai") >= 0 || index(h, "workbuddy.ai") >= 0 ||
+	    index(h, "agentbell.app") >= 0 || index(h, "metaaivm.com") >= 0 || index(h, "usemagpie.ai") >= 0 ||
+	    index(h, "raycast.com") >= 0 || index(h, "ray.so") >= 0 ||
+	    substr(h, 0, 7) == "20.213." || substr(h, 0, 8) == "172.207." || substr(h, 0, 6) == "4.217.") {
 		return "openai";
 	}
+
+	// 8. Google
 	if (index(h, "google.com") >= 0 || index(h, "googleapis.com") >= 0 || index(h, "gstatic.com") >= 0 ||
-	    index(h, "googleusercontent.com") >= 0 || index(h, "youtube.com") >= 0 || index(app, "google") >= 0 || index(app, "youtube") >= 0) {
+	    index(h, "googleusercontent.com") >= 0 || index(h, "youtube.com") >= 0 ||
+	    index(app, "google") >= 0 || index(app, "youtube") >= 0) {
 		return "google";
 	}
+
+	// 9. Alibaba / Taobao / DingTalk / Quark
 	if (index(h, "alibaba.com") >= 0 || index(h, "alicdn.com") >= 0 || index(h, "aliyuncs.com") >= 0 ||
-	    index(h, "taobao.com") >= 0 || index(h, "goofish.com") >= 0 || index(h, "alipay.com") >= 0 || h == "223.5.5.5" || h == "223.6.6.6") {
+	    index(h, "taobao.com") >= 0 || index(h, "goofish.com") >= 0 || index(h, "alipay.com") >= 0 ||
+	    index(h, "mmstat.com") >= 0 || index(h, "dingtalk.com") >= 0 || index(h, "quark.cn") >= 0 ||
+	    index(h, "npmmirror.com") >= 0 || index(h, "alidns.com") >= 0 || h == "223.5.5.5" || h == "223.6.6.6") {
 		return "alibaba";
 	}
-	if (index(h, "cmschina.com") >= 0 || index(h, "newone.com.cn") >= 0) {
+
+	// 10. JD.com / Vipshop (京东 / 电商)
+	if (index(h, "jd.com") >= 0 || index(h, "360buyimg.com") >= 0 || index(h, "300hu.com") >= 0 ||
+	    index(h, "jdcloud.com") >= 0 || index(h, "jdcloud-oss.com") >= 0 || index(h, "jcloud.com") >= 0 ||
+	    index(h, "vip.com") >= 0) {
+		return "jd";
+	}
+
+	// 11. China Merchants Securities (招商证券 / 一户通客户端直连专线 & 行情服务)
+	if (index(h, "cmschina.com") >= 0 || index(h, "newone.com.cn") >= 0 || index(h, "sseinfo.com") >= 0 ||
+	    index(h, "yundzh.com") >= 0 || index(h, "cninfo.com.cn") >= 0 ||
+	    substr(h, 0, 12) == "114.141.177." || substr(h, 0, 11) == "210.21.237." ||
+	    h == "120.79.73.168" || substr(h, 0, 9) == "14.21.47." || substr(h, 0, 11) == "10.254.247." ||
+	    port == 22016 || port == 22017 || port == 7731 || port == 7706 || port == 7717) {
 		return "cmschina";
 	}
-	if (index(h, "dbankcloud.cn") >= 0 || index(h, "dbankcloud.com") >= 0 || index(h, "hicloud.com") >= 0 ||
-	    index(h, "huawei.com") >= 0 || index(h, "vmall.com") >= 0 || index(h, "hihonor.com") >= 0) {
+
+	// 12. Huawei Cloud & HMS Mobile Services
+	if (index(h, "dbankcloud.cn") >= 0 || index(h, "dbankcloud.com") >= 0 || index(h, "dbankcdn.com") >= 0 ||
+	    index(h, "dbankcdn.cn") >= 0 || index(h, "hicloud.com") >= 0 || index(h, "huawei.com") >= 0 ||
+	    index(h, "vmall.com") >= 0 || index(h, "hihonor.com") >= 0 || index(h, "droiyou.com") >= 0 ||
+	    index(h, "chujingapp.com") >= 0 || index(h, "zztfly.com") >= 0 ||
+	    index(app, "huawei") >= 0 || substr(h, 0, 8) == "49.4.18." || substr(h, 0, 7) == "124.70.") {
 		return "huawei";
 	}
-	if (index(h, "github.com") >= 0 || index(h, "githubusercontent.com") >= 0 || index(app, "github") >= 0) {
+
+	// 13. GitHub & Developer CDNs
+	if (index(h, "github.com") >= 0 || index(h, "githubusercontent.com") >= 0 || index(h, "jsdelivr.net") >= 0 ||
+	    index(h, "unpkg.com") >= 0 || index(h, "sentry.io") >= 0 || index(h, "ksyuncdn.com") >= 0 ||
+	    index(h, "npmjs.org") >= 0 || index(h, "opencollective.com") >= 0 || index(h, "metacubex.one") >= 0 ||
+	    index(h, "qtlcdn.com") >= 0 || index(h, "defined.net") >= 0 || index(app, "github") >= 0) {
 		return "github";
 	}
+
+	// 14. X / Twitter
 	if (h == "x.com" || index(h, ".x.com") >= 0 || index(h, "twitter.com") >= 0 || index(h, "twimg.com") >= 0) {
 		return "twitter";
 	}
+
+	// 15. Check learned IP/Subnet24 cache from passive DNS / mihomo / TLS Cert
+	if (ip_to_domain[h]) {
+		return classify_host(ip_to_domain[h], dpi_app, dst_port);
+	}
+	let s24 = get_subnet24(h);
+	if (s24 != "" && subnet24_to_group[s24]) {
+		return subnet24_to_group[s24].group_id;
+	}
+
 	return "unknown";
 }
 
-function get_provider_hint(host) {
+function get_provider_hint(host, dst_port) {
 	let h = lc(host || "");
+	let port = int(dst_port || 0);
+	if (substr(h, 0, 12) == "114.141.177." || port == 22016 || port == 22017) return "招商证券一户通 · 行情推送专线 (TCP 22016/22017)";
+	if (substr(h, 0, 11) == "210.21.237." || port == 7731) return "招商证券一户通 · 交易/行情节点 (TCP 7731)";
+	if (h == "120.79.73.168" || port == 7706) return "招商证券一户通 · 阿里云行情节点 (TCP 7706)";
+	if (substr(h, 0, 11) == "10.254.247.") return "招商证券 · 内网服务专线";
+	if (substr(h, 0, 9) == "14.21.47.") return "招商证券 · 深圳电信节点";
+	if (substr(h, 0, 11) == "119.147.19." || substr(h, 0, 8) == "157.148." || substr(h, 0, 7) == "183.60.") return "Tencent WeChat 直连长连接节点";
+	if (substr(h, 0, 7) == "20.213.") return "Microsoft Azure · WebRTC/STUN 实时流 (UDP 3478)";
+	if (substr(h, 0, 12) == "162.159.200.") return "Cloudflare NTP 时间同步服务";
+	if (substr(h, 0, 8) == "49.4.18." || substr(h, 0, 7) == "124.70.") return "Huawei Cloud · HMS 移动推送节点";
 	if (index(h, "myqcloud.com") >= 0 || index(h, "qcloud.com") >= 0 || index(h, "gtimg.com") >= 0) return "Tencent cloud cdn";
-	if (index(h, "weixin.qq.com") >= 0 || index(h, "wechat.com") >= 0 || index(h, "qq.com") >= 0) return "Tencent WeChat / QQ";
-	if (index(h, "aliyuncs.com") >= 0 || index(h, "alicdn.com") >= 0 || index(h, "alibaba.com") >= 0) return "Alibaba Cloud CDN / OSS";
+	if (index(h, "weixin.qq.com") >= 0 || index(h, "weixin.com") >= 0 || index(h, "wechat.com") >= 0 || index(h, "qpic.cn") >= 0 || index(h, "qlogo.cn") >= 0) return "Tencent WeChat / 微信服务";
+	if (index(h, "qq.com") >= 0 || index(h, "tencent.com") >= 0) return "Tencent QQ / 腾讯网";
+	if (index(h, "sogou.com") >= 0 || index(h, "sogo.com") >= 0) return "Sogou 搜狗输入法 / 搜索";
+	if (index(h, "jd.com") >= 0 || index(h, "360buyimg.com") >= 0) return "JD.com 京东商城 / 静态资源 CDN";
+	if (index(h, "aliyuncs.com") >= 0 || index(h, "alicdn.com") >= 0 || index(h, "alibaba.com") >= 0 || index(h, "mmstat.com") >= 0 || index(h, "dingtalk.com") >= 0 || index(h, "quark.cn") >= 0) return "Alibaba Cloud / 阿里生态";
 	if (index(h, "googleapis.com") >= 0 || index(h, "google.com") >= 0 || index(h, "gstatic.com") >= 0) return "Google Cloud / APIs";
-	if (index(h, "chatgpt.com") >= 0 || index(h, "openai.com") >= 0) return "OpenAI Edge Network";
+	if (index(h, "chatgpt.com") >= 0 || index(h, "openai.com") >= 0 || index(h, "openrouter.ai") >= 0 || index(h, "deepseek.com") >= 0 || index(h, "grok.com") >= 0 || index(h, "opencode.ai") >= 0) return "AI 大模型与编程助手服务";
 	if (index(h, "apple.com") >= 0 || index(h, "icloud.com") >= 0) return "Apple iCloud / Push";
 	if (index(h, "cloudflare.com") >= 0) return "Cloudflare Edge";
-	if (index(h, "dbankcloud") >= 0 || index(h, "hicloud.com") >= 0) return "Huawei Cloud Telemetry";
-	if (index(h, "cmschina.com") >= 0 || index(h, "newone.com.cn") >= 0) return "China Merchants Securities";
-	if (index(h, "feishu.cn") >= 0 || index(h, "larksuite.com") >= 0) return "ByteDance Lark / Feishu";
+	if (index(h, "dbankcloud") >= 0 || index(h, "dbankcdn") >= 0 || index(h, "hicloud.com") >= 0) return "Huawei Cloud 终端与遥测服务";
+	if (index(h, "cmschina.com") >= 0 || index(h, "newone.com.cn") >= 0 || index(h, "sseinfo.com") >= 0 || index(h, "yundzh.com") >= 0) return "招商证券 / 金融行情服务";
+	if (index(h, "feishu.cn") >= 0 || index(h, "larksuite.com") >= 0 || index(h, "bytedance.com") >= 0 || index(h, "doubao.com") >= 0) return "ByteDance 飞书 / 豆包 / 字节服务";
 	return "Direct / Unknown ASN";
 }
 
@@ -327,8 +452,8 @@ function evaluate_host_heuristics(h_entry) {
 // Record a connection sample into history
 function record_flow_sample(src_ip, host, dst_ip, dst_port, proto, delta_up, delta_down, total_conn_up, is_new_conn, encrypted, dpi_app, dpi_proto, device_total_bps) {
 	if (!host || host == "") host = dst_ip || "unknown";
-	// Ignore local router accesses
-	if (substr(host, 0, 10) == "192.168.8." || host == "127.0.0.1" || substr(host, 0, 8) == "198.18.0") return;
+	// Ignore local router accesses and outer proxy relay server IPs (inner connections are already tracked with real domains)
+	if (substr(host, 0, length(LAN_PREFIX)) == LAN_PREFIX || host == "127.0.0.1" || substr(host, 0, 8) == "198.18.0" || substr(host, 0, 8) == "172.254." || proxy_server_ips[host]) return;
 
 	let now = time();
 	let dp = get_date_parts(now);
@@ -342,11 +467,11 @@ function record_flow_sample(src_ip, host, dst_ip, dst_port, proto, delta_up, del
 
 	let h_entry = history.hosts[host];
 	if (!h_entry) {
-		let gid = classify_host(host, dpi_app);
+		let gid = classify_host(host, dpi_app, dst_port);
 		h_entry = {
 			host: host,
 			group_id: gid,
-			provider: get_provider_hint(host),
+			provider: get_provider_hint(host, dst_port),
 			up: 0,
 			down: 0,
 			conn_count: 0,
@@ -438,6 +563,10 @@ function handle_netify_line(line) {
 	if (msg.type == "flow" && msg.flow) {
 		let f = msg.flow;
 		let host = f.host_server_name || (f.ssl && f.ssl.client_sni) || (f.http && f.http.host) || (f.dns && f.dns.query_hostname) || "";
+		if (host == "" && f.ssl && f.ssl.subject_dn) {
+			let m_cn = match(f.ssl.subject_dn, /CN=\*?\.?([a-zA-Z0-9._-]+\.[a-zA-Z]+)/);
+			if (m_cn) host = m_cn[1];
+		}
 		let proto_name = f.detected_protocol_name || "";
 		let app_name = f.detected_application_name || "";
 		let local_ip = f.local_ip || "";
@@ -478,6 +607,7 @@ function handle_netify_line(line) {
 		dpi_flows[src_ip + ":" + src_port] = info;
 		if (host != "" && substr(dst_ip, 0, 7) != "198.18.") {
 			dpi_flows[dst_ip + ":" + dst_port] = info;
+			learn_ip_domain(dst_ip, host, classify_host(host, app_name, dst_port));
 		}
 		if (host != "") {
 			dpi_flows["host:" + lc(host)] = info;
@@ -558,7 +688,7 @@ function fetch_conntrack_direct(mihomo_ports) {
 		let up_bytes = int(m_src[5]);
 		let down_bytes = int(m_src[6]);
 
-		if (src_ip == "192.168.8.1" || dst_ip == "192.168.8.1" || substr(dst_ip, 0, 7) == "198.18.") continue;
+		if (src_ip == ROUTER_IP || dst_ip == ROUTER_IP || substr(dst_ip, 0, 7) == "198.18." || proxy_server_ips[dst_ip]) continue;
 		if (mihomo_ports[src_ip + ":" + sport]) continue;
 
 		let proto = (index(line, "tcp") >= 0) ? "tcp" : "udp";
@@ -621,6 +751,11 @@ function sample_traffic() {
 		let dpi = dpi_flows[src_ip + ":" + sport] || dpi_flows["host:" + lc(host)];
 		if ((host == "" || host == "unknown" || substr(host, 0, 7) == "198.18.") && dpi && dpi.host) {
 			host = dpi.host;
+		}
+		if (dst_ip != "" && host != "" && host != dst_ip) {
+			learn_ip_domain(dst_ip, host, classify_host(host, dpi ? dpi.app : "", dport));
+		} else if (host == dst_ip && ip_to_domain[dst_ip]) {
+			host = ip_to_domain[dst_ip];
 		}
 		let encrypted = true;
 		if (dport == 80 || dport == 8080 || (dport != 123 && dport != 53 && dpi && dpi.encrypted === false)) {
@@ -715,7 +850,7 @@ function sample_traffic() {
 		router_up_bps += delta.up_bps;
 		router_down_bps += delta.down_bps;
 
-		let gid = classify_host(c.dst_host, c.dpi_app);
+		let gid = classify_host(c.dst_host, c.dpi_app, c.dst_port);
 		let gmeta = SERVICE_GROUPS[gid] || SERVICE_GROUPS["unknown"];
 		if (!live_groups[gid]) {
 			live_groups[gid] = {
@@ -768,8 +903,13 @@ function sample_traffic() {
 	let alerts = [];
 	let alert_groups_seen = {};
 	for (let hname, hentry in history.hosts) {
-		let gid = hentry.group_id || classify_host(hname, hentry.dpi_app);
+		if (proxy_server_ips[hname] || substr(hname, 0, 8) == "172.254.") {
+			delete history.hosts[hname];
+			continue;
+		}
+		let gid = classify_host(hname, hentry.dpi_app, 0);
 		hentry.group_id = gid;
+		hentry.provider = get_provider_hint(hname, 0);
 		let gmeta = SERVICE_GROUPS[gid] || SERVICE_GROUPS["unknown"];
 		if (!live_groups[gid]) {
 			live_groups[gid] = {
