@@ -1,0 +1,669 @@
+#!/usr/bin/ucode
+// NightNight 0.6.0 - CGI REST API & MCP JSON-RPC Server
+
+import * as fs from "fs";
+
+const LIVE_FILE = "/tmp/nightnight/live.json";
+const HIST_TMP_FILE = "/tmp/nightnight/history.json";
+const HIST_ETC_FILE = "/etc/nightnight/history.json";
+const DEVICES_ETC_FILE = "/etc/nightnight/devices.json";
+
+function load_json(path) {
+	let raw = fs.readfile(path);
+	if (!raw) return null;
+	let data = null;
+	try {
+		data = json(raw);
+	} catch (e) {
+		data = null;
+	}
+	return data;
+}
+
+function save_json(path, data) {
+	let tmp = path + ".tmp";
+	fs.writefile(tmp, sprintf("%J", data));
+	fs.rename(tmp, path);
+}
+
+function urldecode(s) {
+	if (!s) return "";
+	s = replace(s, /\+/g, " ");
+	return replace(s, /%([0-9a-fA-F]{2})/g, function(m, hex) {
+		return chr(int(hex, 16));
+	});
+}
+
+function parse_query(qs) {
+	let params = {};
+	if (!qs) return params;
+	for (let pair in split(qs, "&")) {
+		let kv = split(pair, "=", 2);
+		if (length(kv) == 2) {
+			params[urldecode(kv[0])] = urldecode(kv[1]);
+		} else if (length(kv) == 1 && kv[0] != "") {
+			params[urldecode(kv[0])] = "";
+		}
+	}
+	return params;
+}
+
+function fmt_bytes(b) {
+	b = int(b || 0);
+	if (b <= 0) return "0 B";
+	if (b < 1024) return b + " B";
+	if (b < 1024 * 1024) {
+		let kb = b / 1024.0;
+		return (kb >= 100 ? sprintf("%d KB", int(kb + 0.5)) : sprintf("%.1f KB", kb));
+	}
+	if (b < 1024 * 1024 * 1024) {
+		let mb = b / (1024.0 * 1024.0);
+		return (mb >= 100 ? sprintf("%d MB", int(mb + 0.5)) : sprintf("%.1f MB", mb));
+	}
+	let gb = b / (1024.0 * 1024.0 * 1024.0);
+	return sprintf("%.2f GB", gb);
+}
+
+function evaluate_heuristics(h_entry) {
+	let h = lc(h_entry.host || "");
+	let tags = [];
+	let notes = [];
+	let score = 0;
+	let reasons = [];
+
+	if (index(h, ".cos.") >= 0 || index(h, ".myqcloud.com") >= 0 || index(h, ".aliyuncs.com") >= 0 ||
+	    index(h, ".s3.") >= 0 || index(h, "amazonaws.com") >= 0 || index(h, "r2.cloudflarestorage.com") >= 0) {
+		push(tags, { text: "共用云存储", type: "neutral" });
+		let bucket = split(h, ".")[0] || h;
+		if (index(h, "myqcloud.com") >= 0) {
+			push(notes, "腾讯云对象存储 (COS)：很多公司共用的主机名。从名字只能知道是哪家的存储服务，不知道数据是谁的。桶名“" + bucket + "”只能当作线索。");
+		} else if (index(h, "aliyuncs.com") >= 0) {
+			push(notes, "阿里云对象存储 (OSS)：很多公司共用的主机名。从名字只能知道是哪家的存储服务，不知道数据是谁的。桶名“" + bucket + "”只能当作线索。");
+		} else {
+			push(notes, "公有云对象存储服务：多个应用共用的存储域名，桶名“" + bucket + "”只能当作线索。");
+		}
+	}
+
+	if (index(h, "wxkb") >= 0 || substr(h, 0, 4) == "ime." || index(h, ".ime.") >= 0 || index(h, "-ime") >= 0 || index(h, "input") >= 0 || index(h, "sogou") >= 0 || index(h, "iflytek") >= 0) {
+		push(tags, { text: "名字像输入法", type: "warn" });
+		score += 45;
+		push(reasons, "名字像输入法");
+		if (index(h, "wxkb") >= 0) {
+			push(notes, "名字里有“wxkb”，看起来像输入法或键盘相关的服务。这只是根据名字猜的。");
+		} else {
+			push(notes, "名字里有输入法相关特征词，看起来像输入法或键盘相关的服务。这只是根据名字猜的。");
+		}
+	}
+
+	if (h_entry.encrypted === false) {
+		push(tags, { text: "未加密", type: "warn" });
+		score += 35;
+		push(reasons, "未加密传输");
+		push(notes, "检测到该主机存在未加密（HTTP 或明文端口）传输行为，数据内容在网络链路中缺乏 TLS 保护。");
+	}
+
+	if (index(h, "metrics") >= 0 || index(h, "telemetry") >= 0 || index(h, "beacon") >= 0 || index(h, "collect") >= 0 ||
+	    index(h, "nel.") >= 0 || index(h, "user-data") >= 0 || index(h, "log") >= 0) {
+		push(tags, { text: "遥测或日志", type: "info" });
+		score += 15;
+		push(reasons, "遥测或数据上报域名");
+		push(notes, "名字包含遥测/数据统计特征（如 metrics / user-data / nel），通常用于客户端后台上报行为或诊断日志。");
+	}
+
+	if ((h_entry.max_single_up || 0) >= 5 * 1024 * 1024 || (h_entry.up || 0) >= 10 * 1024 * 1024) {
+		score += 50;
+		push(reasons, "单次或累计大额上传 (" + fmt_bytes(h_entry.max_single_up || h_entry.up) + ")");
+	} else if ((h_entry.up || 0) >= 1024 * 1024 && (h_entry.up || 0) > (h_entry.down || 1) * 3) {
+		score += 30;
+		push(reasons, "上传量显著高于下载量");
+	}
+
+	if ((h_entry.night_up || 0) >= 100 * 1024) {
+		score += 25;
+		push(reasons, "存在夜间上传 (" + fmt_bytes(h_entry.night_up) + ")");
+	}
+
+	unshift(notes, "路由器上的名单里没有这个网站的说明。");
+
+	return { tags, notes, score, reasons };
+}
+
+function compute_active_duration(active_hours_map) {
+	let hours = keys(active_hours_map || {});
+	let hour_count = length(hours);
+	if (hour_count == 0) hour_count = 1;
+	let days_map = {};
+	for (let h in hours) {
+		let d = substr(h, 0, 10);
+		days_map[d] = true;
+	}
+	let day_count = length(keys(days_map));
+	if (day_count == 0) day_count = 1;
+	return {
+		days: day_count,
+		hours: hour_count,
+		label: day_count + " 天 · " + hour_count + " 小时"
+	};
+}
+
+function get_devices_map(live, custom_devs) {
+	let m = {};
+	if (type(custom_devs) == "object") {
+		for (let ip, d in custom_devs) m[ip] = d.name || ip;
+	}
+	if (live && type(live.devices) == "array") {
+		for (let d in live.devices) m[d.ip] = d.name || d.ip;
+	}
+	return m;
+}
+
+function build_host_item(h_entry, dev_names_map, filter_dev) {
+	let up = h_entry.up || 0;
+	let down = h_entry.down || 0;
+	let conn_count = h_entry.conn_count || 1;
+	let max_single_up = h_entry.max_single_up || up;
+	let night_up = h_entry.night_up || 0;
+	let idle_up = h_entry.idle_up || 0;
+
+	let devs = h_entry.devices || {};
+	let dev_ips = keys(devs);
+	if (filter_dev && filter_dev != "all" && filter_dev != "") {
+		let dstat = devs[filter_dev];
+		if (!dstat) return null;
+		up = dstat.up || 0;
+		down = dstat.down || 0;
+		conn_count = dstat.conn_count || 1;
+		max_single_up = dstat.max_single_up || up;
+		night_up = dstat.night_up || 0;
+	}
+
+	let dev_count = length(dev_ips);
+	let dev_label = "";
+	if (dev_count == 1) {
+		let only_ip = dev_ips[0];
+		dev_label = dev_names_map[only_ip] || only_ip;
+	} else if (dev_count > 1) {
+		dev_label = dev_count + " 台设备在用";
+	} else {
+		dev_label = "1 台设备在用";
+	}
+
+	let dur = compute_active_duration(h_entry.active_hours);
+	let heur = evaluate_heuristics(h_entry);
+
+	return {
+		host: h_entry.host,
+		group_id: h_entry.group_id || "unknown",
+		provider: h_entry.provider || "Direct / CDN",
+		up: up,
+		down: down,
+		conn_count: conn_count,
+		max_single_up: max_single_up,
+		night_up: night_up,
+		idle_up: idle_up,
+		encrypted: (h_entry.encrypted !== false),
+		dpi_app: h_entry.dpi_app || "",
+		dpi_proto: h_entry.dpi_proto || "TLS",
+		device_count: dev_count || 1,
+		device_label: dev_label,
+		devices: devs,
+		active_days: dur.days,
+		active_hours: dur.hours,
+		active_label: dur.label,
+		tags: heur.tags,
+		notes: heur.notes,
+		suspicious_score: heur.score,
+		suspicious_reasons: heur.reasons
+	};
+}
+
+function build_inspect_response(host_query, device_filter, days_filter, hist, live, custom_devs) {
+	let dev_names = get_devices_map(live, custom_devs);
+	let hosts = (hist && hist.hosts) ? hist.hosts : {};
+	let target = hosts[host_query];
+
+	// Fuzzy match if exact host not found
+	if (!target && host_query) {
+		let lq = lc(host_query);
+		let best_up = -1;
+		for (let k, v in hosts) {
+			if (index(lc(k), lq) >= 0 && (v.up || 0) > best_up) {
+				target = v;
+				best_up = v.up || 0;
+			}
+		}
+	}
+
+	if (!target) {
+		return {
+			found: false,
+			query: host_query
+		};
+	}
+
+	let total_all_up = 0;
+	for (let k, v in hosts) {
+		total_all_up += (v.up || 0);
+	}
+	if (total_all_up <= 0) total_all_up = 1;
+
+	let item = build_host_item(target, dev_names, device_filter);
+	if (!item) {
+		item = build_host_item(target, dev_names, "all");
+	}
+
+	let up_share_pct = int((item.up * 100.0) / total_all_up + 0.5);
+	if (up_share_pct < 1 && item.up > 0) up_share_pct = 1;
+	let ratio_str = "";
+	if (item.up >= item.down && item.down > 0) {
+		let r = int((item.up * 1.0) / item.down + 0.5);
+		if (r < 1) r = 1;
+		ratio_str = "上传/下载 " + r + "×";
+	} else if (item.down > item.up && item.up > 0) {
+		let r = int((item.down * 1.0) / item.up + 0.5);
+		ratio_str = "下载/上传 " + r + "×";
+	} else {
+		ratio_str = "主要为单向传输";
+	}
+
+	let avg_conn_up = item.conn_count > 0 ? int(item.up / item.conn_count) : item.up;
+	let night_pct = item.up > 0 ? int((item.night_up * 100.0) / item.up + 0.5) : 0;
+	let idle_pct = item.up > 0 ? int((item.idle_up * 100.0) / item.up + 0.5) : 0;
+
+	// Synthesize "它在干什么？" natural language analysis matching Screenshot 3
+	let big_hours_map = target.big_hours || {};
+	let big_hours_count = length(keys(big_hours_map));
+	let big_hours_up = 0;
+	for (let hk, hv in big_hours_map) big_hours_up += hv;
+	if (big_hours_count == 0 && item.max_single_up >= 1024 * 1024) {
+		big_hours_count = item.active_hours;
+		big_hours_up = item.up;
+	}
+	let big_share_pct = item.up > 0 ? int((big_hours_up * 100.0) / item.up + 0.5) : 100;
+	if (big_share_pct > 100) big_share_pct = 100;
+
+	let behavior_summary = "";
+	if (item.max_single_up >= 1024 * 1024) {
+		behavior_summary = sprintf(
+			"少数几次大的上传：有 %d 个小时里，单条连接传了超过 1 MB；这些小时一共上传 %s，占这里全部上传的 %d%%。传文件、照片、视频或做备份通常是这个样子。",
+			big_hours_count || 1,
+			fmt_bytes(big_hours_up > 0 ? big_hours_up : item.up),
+			big_share_pct
+		);
+	} else if (item.conn_count >= 20 && avg_conn_up < 100 * 1024) {
+		behavior_summary = sprintf(
+			"高频小数据包通信：累计建立了 %d 条连接，平均每次连接仅上传 %s（最大单条 %s）。后台心跳、遥测上报、输入法云联想或消息同步通常是这个样子。",
+			item.conn_count,
+			fmt_bytes(avg_conn_up),
+			fmt_bytes(item.max_single_up)
+		);
+	} else if (item.down > item.up * 3) {
+		behavior_summary = sprintf(
+			"以下载拉取内容为主：累计下载 %s，而上传仅 %s（共 %d 条连接）。正常浏览网页、拉取静态资源、软件更新或流媒体播放通常是这个样子。",
+			fmt_bytes(item.down),
+			fmt_bytes(item.up),
+			item.conn_count
+		);
+	} else {
+		behavior_summary = sprintf(
+			"常规双向数据交互：在 %d 个活跃小时内建立了 %d 条连接，累计上传 %s、下载 %s，单条连接最大上传 %s。",
+			item.active_hours,
+			item.conn_count,
+			fmt_bytes(item.up),
+			fmt_bytes(item.down),
+			fmt_bytes(item.max_single_up)
+		);
+	}
+
+	let dev_breakdown = [];
+	for (let dip, dstat in (target.devices || {})) {
+		push(dev_breakdown, {
+			ip: dip,
+			name: dev_names[dip] || dip,
+			up: dstat.up || 0,
+			down: dstat.down || 0,
+			conn_count: dstat.conn_count || 1,
+			max_single_up: dstat.max_single_up || 0
+		});
+	}
+	sort(dev_breakdown, function(a, b) { return b.up - a.up; });
+
+	return {
+		found: true,
+		host: item.host,
+		group_id: item.group_id,
+		provider: item.provider,
+		tags: item.tags,
+		up: item.up,
+		down: item.down,
+		up_share_pct: up_share_pct,
+		ratio_str: ratio_str,
+		conn_count: item.conn_count,
+		avg_conn_up: avg_conn_up,
+		max_single_up: item.max_single_up,
+		active_days: item.active_days,
+		active_hours: item.active_hours,
+		night_up: item.night_up,
+		night_pct: night_pct,
+		idle_up: item.idle_up,
+		idle_pct: idle_pct,
+		behavior_summary: behavior_summary,
+		notes: item.notes,
+		devices: dev_breakdown
+	};
+}
+
+// Seed or clear demo WeChat input method records from the tweet so user can inspect both live traffic & tweet case study
+function seed_tweet_case_study(hist) {
+	if (!hist.hosts) hist.hosts = {};
+	let now = time();
+	hist.hosts["wxkb-res-1258476243.cos.ap-shanghai.myqcloud.com"] = {
+		host: "wxkb-res-1258476243.cos.ap-shanghai.myqcloud.com",
+		group_id: "wechat",
+		provider: "Tencent cloud cdn",
+		up: 45927628, // 43.8 MB
+		down: 754688, // 737 KB
+		conn_count: 3,
+		max_single_up: 22020096, // 21 MB
+		night_up: 0,
+		idle_up: 0,
+		encrypted: true,
+		dpi_app: "WeChat",
+		dpi_proto: "TLS",
+		first_seen: now - 172800,
+		last_seen: now - 3600,
+		active_hours: {
+			"2026-11-09-14": { up: 22020096, down: 350000, max_up: 22020096 },
+			"2026-11-09-21": { up: 12907532, down: 204688, max_up: 12907532 },
+			"2026-11-10-11": { up: 11000000, down: 200000, max_up: 11000000 }
+		},
+		big_hours: {
+			"2026-11-09-14": 22020096,
+			"2026-11-09-21": 12907532,
+			"2026-11-10-11": 11000000
+		},
+		devices: {
+			"192.168.8.245": { ip: "192.168.8.245", up: 25927628, down: 454688, conn_count: 2, max_single_up: 22020096, night_up: 0, idle_up: 0, last_seen: now - 3600 },
+			"192.168.8.208": { ip: "192.168.8.208", up: 20000000, down: 300000, conn_count: 1, max_single_up: 20000000, night_up: 0, idle_up: 0, last_seen: now - 7200 }
+		}
+	};
+	hist.hosts["wxkb-audio-1258344707.cos.ap-shanghai.myqcloud.com"] = {
+		host: "wxkb-audio-1258344707.cos.ap-shanghai.myqcloud.com",
+		group_id: "wechat",
+		provider: "Tencent cloud cdn",
+		up: 8388608, // 8 MB
+		down: 1887436, // 1.8 MB
+		conn_count: 224,
+		max_single_up: 187392, // 183 KB
+		night_up: 184320, // 180 KB
+		idle_up: 184320,
+		encrypted: true,
+		dpi_app: "WeChat",
+		dpi_proto: "TLS",
+		first_seen: now - 259200,
+		last_seen: now - 1800,
+		active_hours: {
+			"2026-11-08-10": { up: 1200000, down: 300000, max_up: 187392 },
+			"2026-11-08-15": { up: 1100000, down: 300000, max_up: 150000 },
+			"2026-11-09-02": { up: 184320, down: 40000, max_up: 92160 },
+			"2026-11-09-18": { up: 2904288, down: 600000, max_up: 180000 },
+			"2026-11-10-09": { up: 3000000, down: 647436, max_up: 187392 }
+		},
+		big_hours: {},
+		devices: {
+			"192.168.8.245": { ip: "192.168.8.245", up: 4388608, down: 987436, conn_count: 112, max_single_up: 187392, night_up: 0, idle_up: 0, last_seen: now - 1800 },
+			"192.168.8.208": { ip: "192.168.8.208", up: 4000000, down: 900000, conn_count: 112, max_single_up: 180000, night_up: 184320, idle_up: 184320, last_seen: now - 3600 }
+		}
+	};
+	hist.hosts["wxkb-user-data-1258344707.cos.ap-shanghai.myqcloud.com"] = {
+		host: "wxkb-user-data-1258344707.cos.ap-shanghai.myqcloud.com",
+		group_id: "wechat",
+		provider: "Tencent cloud cdn",
+		up: 205824, // 201 KB
+		down: 12492, // 12.2 KB
+		conn_count: 3,
+		max_single_up: 205824, // 201 KB
+		night_up: 0,
+		idle_up: 0,
+		encrypted: false, // triggers 未加密 badge on 微信 group
+		dpi_app: "WeChat",
+		dpi_proto: "HTTP",
+		first_seen: now - 86400,
+		last_seen: now - 7200,
+		active_hours: {
+			"2026-11-10-10": { up: 205824, down: 12492, max_up: 205824 }
+		},
+		big_hours: {},
+		devices: {
+			"192.168.8.208": { ip: "192.168.8.208", up: 205824, down: 12492, conn_count: 3, max_single_up: 205824, night_up: 0, idle_up: 0, last_seen: now - 7200 }
+		}
+	};
+	save_json(HIST_TMP_FILE, hist);
+	save_json(HIST_ETC_FILE, hist);
+}
+
+// Handle HTTP request
+let method = getenv("REQUEST_METHOD") || "GET";
+let qs = getenv("QUERY_STRING") || "";
+let params = parse_query(qs);
+let action = params.action || "overview";
+
+let live = load_json(LIVE_FILE) || {
+	version: "0.6.0",
+	ui_version: "0.6.0-1",
+	router: { up_bps: 0, down_bps: 0, active_devices: 0, total_devices: 0, active_groups: 0, total_groups: 0, today_up: 0, today_down: 0, total_connections: 0, status_text: "正在初始化..." },
+	alerts: [],
+	devices: [],
+	groups: [],
+	connections: []
+};
+let hist = load_json(HIST_TMP_FILE) || load_json(HIST_ETC_FILE) || { hosts: {} };
+let custom_devs = load_json(DEVICES_ETC_FILE) || {};
+let dev_names = get_devices_map(live, custom_devs);
+
+print("Content-Type: application/json; charset=utf-8\r\n");
+print("Access-Control-Allow-Origin: *\r\n");
+print("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
+print("Access-Control-Allow-Headers: Content-Type\r\n");
+print("Cache-Control: no-store\r\n\r\n");
+
+if (method == "OPTIONS") {
+	print("{}\n");
+	exit(0);
+}
+
+// Support MCP JSON-RPC 2.0 over HTTP POST
+if (method == "POST" && (action == "mcp" || action == "overview")) {
+	let body = fs.readfile("/dev/stdin");
+	let rpc = null;
+	try {
+		rpc = json(body);
+	} catch (e) {
+		rpc = null;
+	}
+	if (rpc && rpc.jsonrpc == "2.0") {
+		let id = rpc.id;
+		let m = rpc.method || "";
+		let p = rpc.params || {};
+
+		if (m == "initialize") {
+			print(sprintf("%J\n", {
+				jsonrpc: "2.0",
+				id: id,
+				result: {
+					protocolVersion: "2024-11-05",
+					capabilities: { tools: {} },
+					serverInfo: { name: "nightnight-openwrt-mcp", version: "0.6.0" }
+				}
+			}));
+			exit(0);
+		}
+		if (m == "notifications/initialized") {
+			print(sprintf("%J\n", { jsonrpc: "2.0", id: id, result: {} }));
+			exit(0);
+		}
+		if (m == "tools/list") {
+			print(sprintf("%J\n", {
+				jsonrpc: "2.0",
+				id: id,
+				result: {
+					tools: [
+						{
+							name: "nightnight_overview",
+							description: "获取 OpenWrt 路由器实时流量拓扑概览、在用设备、去向分类及异常告警",
+							inputSchema: { type: "object", properties: {} }
+						},
+						{
+							name: "nightnight_suspicious_uploads",
+							description: "查询路由器审计发现的可疑上传行为（如大额单条连接上传、输入法/云存储可疑上传、夜间静默上传、未加密明文传输等）",
+							inputSchema: {
+								type: "object",
+								properties: {
+									min_score: { type: "number", description: "最低可疑评分阈值，默认 15" }
+								}
+							}
+						},
+						{
+							name: "nightnight_inspect_host",
+							description: "查网站：深入分析某个主机名/域名的历史流量特征（上传/下载、最大单次连接、夜间上传、活跃小时数及自然语言行为画像“它在干什么？”）",
+							inputSchema: {
+								type: "object",
+								properties: {
+									host: { type: "string", description: "要查询的域名或主机名关键字，例如 wxkb 或 googleapis.com" },
+									device: { type: "string", description: "可选设备 IP 过滤，默认 all" }
+								},
+								required: ["host"]
+							}
+						},
+						{
+							name: "nightnight_group_hosts",
+							description: "列出某个去向分类（如 wechat, tencent, google, openai, alibaba, apple, unknown 或 all）下的所有主机名明细，按上传流量降序排列",
+							inputSchema: {
+								type: "object",
+								properties: {
+									group_id: { type: "string", description: "去向分类 ID（如 wechat, tencent, google, openai, all）" }
+								}
+							}
+						}
+					]
+				}
+			}));
+			exit(0);
+		}
+		if (m == "tools/call") {
+			let tname = p.name || "";
+			let targs = p.arguments || {};
+			let result_data = {};
+
+			if (tname == "nightnight_overview") {
+				result_data = {
+					router: live.router,
+					alerts: live.alerts,
+					devices: live.devices,
+					groups: live.groups
+				};
+			} else if (tname == "nightnight_suspicious_uploads") {
+				let min_sc = int(targs.min_score || 15);
+				let list = [];
+				for (let hk, hv in (hist.hosts || {})) {
+					let item = build_host_item(hv, dev_names, "all");
+					if (item && (item.suspicious_score >= min_sc || item.up >= 1024 * 1024)) {
+						push(list, item);
+					}
+				}
+				sort(list, function(a, b) { return (b.suspicious_score - a.suspicious_score) || (b.up - a.up); });
+				result_data = { count: length(list), suspicious_hosts: slice(list, 0, 30) };
+			} else if (tname == "nightnight_inspect_host") {
+				result_data = build_inspect_response(targs.host || "", targs.device || "all", 7, hist, live, custom_devs);
+			} else if (tname == "nightnight_group_hosts") {
+				let gid = targs.group_id || "all";
+				let list = [];
+				for (let hk, hv in (hist.hosts || {})) {
+					if (gid != "all" && hv.group_id != gid) continue;
+					let item = build_host_item(hv, dev_names, "all");
+					if (item) push(list, item);
+				}
+				sort(list, function(a, b) { return b.up - a.up; });
+				result_data = { group_id: gid, count: length(list), hosts: slice(list, 0, 50) };
+			} else {
+				result_data = { error: "Unknown tool: " + tname };
+			}
+
+			print(sprintf("%J\n", {
+				jsonrpc: "2.0",
+				id: id,
+				result: {
+					content: [
+						{ type: "text", text: sprintf("%J", result_data) }
+					]
+				}
+			}));
+			exit(0);
+		}
+	}
+}
+
+if (action == "overview") {
+	print(sprintf("%J\n", live));
+	exit(0);
+}
+
+if (action == "hosts" || action == "group") {
+	let gid = params.id || params.group || "all";
+	let dev_filter = params.device || "all";
+	let q = lc(params.q || "");
+	let list = [];
+	for (let hk, hv in (hist.hosts || {})) {
+		if (gid != "all" && hv.group_id != gid) continue;
+		if (q != "" && index(lc(hk), q) < 0) continue;
+		let item = build_host_item(hv, dev_names, dev_filter);
+		if (item) push(list, item);
+	}
+	sort(list, function(a, b) {
+		return (b.up - a.up) || (b.down - a.down);
+	});
+	print(sprintf("%J\n", {
+		group_id: gid,
+		device: dev_filter,
+		total: length(list),
+		hosts: slice(list, 0, 100),
+		devices_list: live.devices || []
+	}));
+	exit(0);
+}
+
+if (action == "inspect") {
+	let hq = params.host || "";
+	let df = params.device || "all";
+	let days = int(params.days || 7);
+	let res = build_inspect_response(hq, df, days, hist, live, custom_devs);
+	res.devices_list = live.devices || [];
+	print(sprintf("%J\n", res));
+	exit(0);
+}
+
+if (action == "suspicious") {
+	let list = [];
+	for (let hk, hv in (hist.hosts || {})) {
+		let item = build_host_item(hv, dev_names, "all");
+		if (item && (item.suspicious_score > 0 || item.up >= 1024 * 1024)) {
+			push(list, item);
+		}
+	}
+	sort(list, function(a, b) {
+		return (b.suspicious_score - a.suspicious_score) || (b.up - a.up);
+	});
+	print(sprintf("%J\n", {
+		count: length(list),
+		items: slice(list, 0, 50)
+	}));
+	exit(0);
+}
+
+if (action == "seed_demo") {
+	seed_tweet_case_study(hist);
+	print(sprintf("%J\n", { ok: true, message: "Seeded wxkb case study hosts into history" }));
+	exit(0);
+}
+
+print(sprintf("%J\n", { error: "Unknown action", action: action }));

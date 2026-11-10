@@ -1,0 +1,10 @@
+{
+	"luci-app-nightnight": {
+		"description": "Grant access to NightNight traffic audit UI",
+		"read": {
+			"ubus": {
+				"file": [ "read", "stat" ]
+			}
+		}
+	}
+}

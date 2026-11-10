@@ -1,0 +1,915 @@
+#!/usr/bin/ucode
+// NightNight 0.6.0 - OpenWrt DPI & Privacy Traffic Audit Daemon
+// Combines netifyd DPI stream + mihomo connections API + nf_conntrack + DHCP leases
+
+import * as uloop from "uloop";
+import * as socket from "socket";
+import * as fs from "fs";
+
+const VERSION = "0.6.0";
+const TMP_DIR = "/tmp/nightnight";
+const ETC_DIR = "/etc/nightnight";
+const LIVE_FILE = TMP_DIR + "/live.json";
+const HIST_TMP_FILE = TMP_DIR + "/history.json";
+const HIST_ETC_FILE = ETC_DIR + "/history.json";
+const DEVICES_ETC_FILE = ETC_DIR + "/devices.json";
+const NETIFY_SOCK = "/var/run/netifyd/netifyd.sock";
+
+// Auto-detect LAN subnet prefix (e.g. "192.168.8.") and router IP from /etc/config/network
+let LAN_PREFIX = "192.168.8.";
+let ROUTER_IP = "192.168.8.1";
+let net_cfg = fs.readfile("/etc/config/network") || "";
+let m_lan = match(net_cfg, /config interface 'lan'[\s\S]*?option ipaddr '([0-9]+\.[0-9]+\.[0-9]+)\.([0-9]+)'/);
+if (m_lan) {
+	LAN_PREFIX = m_lan[1] + ".";
+	ROUTER_IP = m_lan[1] + "." + m_lan[2];
+}
+
+fs.mkdir(TMP_DIR);
+fs.mkdir(ETC_DIR);
+
+// State structures
+let custom_devices = {};
+let dhcp_devices = {}; // ip -> { mac, name, icon }
+let mac_to_ip = {};
+
+// Active connection tracking: conn_id -> { src_ip, dst_host, dst_ip, dst_port, proto, up, down, start_ts, encrypted, dpi_app, dpi_proto }
+let prev_conns = {};
+// Recent DPI flow metadata from netifyd: key -> { host, app, proto, encrypted, risks, subject_dn, ts }
+let dpi_flows = {};
+let netify_connected = false;
+let netify_flow_count = 0;
+
+// Persistent history structure
+let history = {
+	version: VERSION,
+	started_at: time(),
+	today_date: "",
+	today_up: 0,
+	today_down: 0,
+	hosts: {} // host -> { host, group_id, up, down, conn_count, max_single_up, night_up, idle_up, encrypted, dpi_app, dpi_proto, first_seen, last_seen, active_hours: {}, big_hours: {}, devices: {} }
+};
+
+function load_json_file(path) {
+	let content = fs.readfile(path);
+	if (!content) return null;
+	let parsed = null;
+	try {
+		parsed = json(content);
+	} catch (e) {
+		parsed = null;
+	}
+	return parsed;
+}
+
+function save_json_file(path, data) {
+	let tmp = path + ".tmp";
+	fs.writefile(tmp, sprintf("%J", data));
+	fs.rename(tmp, path);
+}
+
+// Load saved custom devices & history
+let saved_devs = load_json_file(DEVICES_ETC_FILE);
+if (type(saved_devs) == "object") {
+	custom_devices = saved_devs;
+} else {
+	// Default known LAN devices on this router
+	custom_devices = {
+		"192.168.8.245": { name: "MacBook-Pro", icon: "laptop" },
+		"192.168.8.208": { name: "HOP-AL00", icon: "phone" },
+		"192.168.8.194": { name: "Mac", icon: "laptop" },
+		"192.168.8.215": { name: "iMac", icon: "laptop" }
+	};
+	save_json_file(DEVICES_ETC_FILE, custom_devices);
+}
+
+let saved_hist = load_json_file(HIST_TMP_FILE) || load_json_file(HIST_ETC_FILE);
+if (type(saved_hist) == "object" && type(saved_hist.hosts) == "object") {
+	history = saved_hist;
+}
+
+function get_date_parts(ts) {
+	let lt = localtime(ts || time());
+	let date_str = sprintf("%04d-%02d-%02d", lt.year, lt.mon, lt.mday);
+	let hour_str = sprintf("%04d-%02d-%02d-%02d", lt.year, lt.mon, lt.mday, lt.hour);
+	let is_night = (lt.hour >= 0 && lt.hour < 6);
+	return { date_str, hour_str, is_night, hour: lt.hour };
+}
+
+// Refresh DHCP leases and ARP table
+function refresh_devices() {
+	let leases = fs.readfile("/tmp/dhcp.leases");
+	if (leases) {
+		for (let line in split(leases, "\n")) {
+			let parts = split(trim(line), /\s+/);
+			if (length(parts) >= 4) {
+				let mac = lc(parts[1]);
+				let ip = parts[2];
+				let name = parts[3];
+				mac_to_ip[mac] = ip;
+				let last_octet = split(ip, ".")[3] || "0";
+				if (!name || name == "*") {
+					name = (custom_devices[ip] && custom_devices[ip].name) ? custom_devices[ip].name : ("未命名设备 #" + last_octet);
+				}
+				let icon = "phone";
+				let ln = lc(name);
+				if (index(ln, "mac") >= 0 || index(ln, "pc") >= 0 || index(ln, "desktop") >= 0 || index(ln, "laptop") >= 0 || index(ln, "win") >= 0) {
+					icon = "laptop";
+				}
+				if (custom_devices[ip] && custom_devices[ip].icon) icon = custom_devices[ip].icon;
+				if (custom_devices[ip] && custom_devices[ip].name) name = custom_devices[ip].name;
+				dhcp_devices[ip] = { ip, mac, name, icon };
+			}
+		}
+	}
+	let arp = fs.readfile("/proc/net/arp");
+	if (arp) {
+		let lines = split(arp, "\n");
+		for (let i = 1; i < length(lines); i++) {
+			let parts = split(trim(lines[i]), /\s+/);
+			if (length(parts) >= 6 && substr(parts[0], 0, 10) == "192.168.8.") {
+				let ip = parts[0];
+				let mac = lc(parts[3]);
+				mac_to_ip[mac] = ip;
+				if (!dhcp_devices[ip]) {
+					let last_octet = split(ip, ".")[3] || "0";
+					let name = (custom_devices[ip] && custom_devices[ip].name) ? custom_devices[ip].name : ("未命名设备 #" + last_octet);
+					let icon = (custom_devices[ip] && custom_devices[ip].icon) ? custom_devices[ip].icon : "phone";
+					dhcp_devices[ip] = { ip, mac, name, icon };
+				}
+			}
+		}
+	}
+}
+
+function get_device_info(ip) {
+	if (!ip || ip == "127.0.0.1" || ip == "198.18.0.1" || ip == ROUTER_IP || substr(ip, 0, 8) == "100.100." || substr(ip, 0, 7) == "172.20." || substr(ip, 0, 8) == "172.254.") {
+		return null; // Router internal / WAN / overlay self-traffic
+	}
+	if (dhcp_devices[ip]) return dhcp_devices[ip];
+	if (substr(ip, 0, length(LAN_PREFIX)) == LAN_PREFIX) {
+		let last_octet = split(ip, ".")[3] || "0";
+		let name = (custom_devices[ip] && custom_devices[ip].name) ? custom_devices[ip].name : ("未命名设备 #" + last_octet);
+		let icon = (custom_devices[ip] && custom_devices[ip].icon) ? custom_devices[ip].icon : "phone";
+		dhcp_devices[ip] = { ip, mac: "", name, icon };
+		return dhcp_devices[ip];
+	}
+	return null;
+}
+
+// Destination Service Classification & Heuristic Rules
+const SERVICE_GROUPS = {
+	"wechat":     { id: "wechat",     name: "微信",       badge: "微", order: 1 },
+	"tencent":    { id: "tencent",    name: "Tencent",    badge: "T",  order: 2 },
+	"lark":       { id: "lark",       name: "Lark",       badge: "L",  order: 3 },
+	"feishu":     { id: "feishu",     name: "Feishu",     badge: "F",  order: 4 },
+	"apple":      { id: "apple",      name: "Apple 服务", badge: "A",  order: 5 },
+	"cloudflare": { id: "cloudflare", name: "Cloudflare", badge: "C",  order: 6 },
+	"openai":     { id: "openai",     name: "OpenAI",     badge: "O",  order: 7 },
+	"google":     { id: "google",     name: "Google",     badge: "G",  order: 8 },
+	"alibaba":    { id: "alibaba",    name: "Alibaba",    badge: "阿", order: 9 },
+	"cmschina":   { id: "cmschina",   name: "招商证券",   badge: "招", order: 10 },
+	"huawei":     { id: "huawei",     name: "华为云服务", badge: "华", order: 11 },
+	"github":     { id: "github",     name: "GitHub",     badge: "GH", order: 12 },
+	"twitter":    { id: "twitter",    name: "X / Twitter",badge: "X",  order: 13 },
+	"unknown":    { id: "unknown",    name: "未识别",     badge: "?",  order: 99 }
+};
+
+function classify_host(host, dpi_app) {
+	let h = lc(host || "");
+	let app = lc(dpi_app || "");
+
+	// Check WeChat first (including wxkb-* WeChat Keyboard & weixin)
+	if (index(h, "weixin.qq.com") >= 0 || index(h, "wechat.com") >= 0 || index(h, "wx.qq.com") >= 0 ||
+	    index(h, "wxkb-") >= 0 || index(h, "tenpay.com") >= 0 || index(h, "servicewechat.com") >= 0 ||
+	    index(h, "qlogo.cn") >= 0 || index(app, "wechat") >= 0 || index(app, "weixin") >= 0) {
+		return "wechat";
+	}
+	if (index(h, "myqcloud.com") >= 0 || index(h, "qq.com") >= 0 || index(h, "gtimg.com") >= 0 ||
+	    index(h, "tencent.com") >= 0 || index(h, "qcloud.com") >= 0 || h == "120.53.53.53" || index(app, "tencent") >= 0 || index(app, "qq") >= 0) {
+		return "tencent";
+	}
+	if (index(h, "larksuite.com") >= 0 || index(h, "larkoffice.com") >= 0) {
+		return "lark";
+	}
+	if (index(h, "feishu.cn") >= 0 || index(h, "feishucdn.com") >= 0 || index(h, "bytedance.com") >= 0 ||
+	    index(h, "byteimg.com") >= 0 || index(h, "snssdk.com") >= 0 || index(h, "douyin.com") >= 0) {
+		return "feishu";
+	}
+	if (index(h, "apple.com") >= 0 || index(h, "icloud.com") >= 0 || index(h, "mzstatic.com") >= 0 ||
+	    index(h, "cdn-apple.com") >= 0 || index(h, "aaplimg.com") >= 0 || index(app, "apple") >= 0 || index(app, "icloud") >= 0) {
+		return "apple";
+	}
+	if (index(h, "cloudflare.com") >= 0 || index(h, "cloudflare-dns.com") >= 0 || h == "1.1.1.1" || h == "1.0.0.1" || index(app, "cloudflare") >= 0) {
+		return "cloudflare";
+	}
+	if (index(h, "chatgpt.com") >= 0 || index(h, "openai.com") >= 0 || index(h, "oaistatic.com") >= 0 || index(h, "oaiusercontent.com") >= 0) {
+		return "openai";
+	}
+	if (index(h, "google.com") >= 0 || index(h, "googleapis.com") >= 0 || index(h, "gstatic.com") >= 0 ||
+	    index(h, "googleusercontent.com") >= 0 || index(h, "youtube.com") >= 0 || index(app, "google") >= 0 || index(app, "youtube") >= 0) {
+		return "google";
+	}
+	if (index(h, "alibaba.com") >= 0 || index(h, "alicdn.com") >= 0 || index(h, "aliyuncs.com") >= 0 ||
+	    index(h, "taobao.com") >= 0 || index(h, "goofish.com") >= 0 || index(h, "alipay.com") >= 0 || h == "223.5.5.5" || h == "223.6.6.6") {
+		return "alibaba";
+	}
+	if (index(h, "cmschina.com") >= 0 || index(h, "newone.com.cn") >= 0) {
+		return "cmschina";
+	}
+	if (index(h, "dbankcloud.cn") >= 0 || index(h, "dbankcloud.com") >= 0 || index(h, "hicloud.com") >= 0 ||
+	    index(h, "huawei.com") >= 0 || index(h, "vmall.com") >= 0 || index(h, "hihonor.com") >= 0) {
+		return "huawei";
+	}
+	if (index(h, "github.com") >= 0 || index(h, "githubusercontent.com") >= 0 || index(app, "github") >= 0) {
+		return "github";
+	}
+	if (h == "x.com" || index(h, ".x.com") >= 0 || index(h, "twitter.com") >= 0 || index(h, "twimg.com") >= 0) {
+		return "twitter";
+	}
+	return "unknown";
+}
+
+function get_provider_hint(host) {
+	let h = lc(host || "");
+	if (index(h, "myqcloud.com") >= 0 || index(h, "qcloud.com") >= 0 || index(h, "gtimg.com") >= 0) return "Tencent cloud cdn";
+	if (index(h, "weixin.qq.com") >= 0 || index(h, "wechat.com") >= 0 || index(h, "qq.com") >= 0) return "Tencent WeChat / QQ";
+	if (index(h, "aliyuncs.com") >= 0 || index(h, "alicdn.com") >= 0 || index(h, "alibaba.com") >= 0) return "Alibaba Cloud CDN / OSS";
+	if (index(h, "googleapis.com") >= 0 || index(h, "google.com") >= 0 || index(h, "gstatic.com") >= 0) return "Google Cloud / APIs";
+	if (index(h, "chatgpt.com") >= 0 || index(h, "openai.com") >= 0) return "OpenAI Edge Network";
+	if (index(h, "apple.com") >= 0 || index(h, "icloud.com") >= 0) return "Apple iCloud / Push";
+	if (index(h, "cloudflare.com") >= 0) return "Cloudflare Edge";
+	if (index(h, "dbankcloud") >= 0 || index(h, "hicloud.com") >= 0) return "Huawei Cloud Telemetry";
+	if (index(h, "cmschina.com") >= 0 || index(h, "newone.com.cn") >= 0) return "China Merchants Securities";
+	if (index(h, "feishu.cn") >= 0 || index(h, "larksuite.com") >= 0) return "ByteDance Lark / Feishu";
+	return "Direct / Unknown ASN";
+}
+
+// Compute heuristic tags and explanations for a host entry
+function evaluate_host_heuristics(h_entry) {
+	let h = lc(h_entry.host || "");
+	let tags = [];
+	let notes = [];
+	let suspicious_score = 0;
+	let suspicious_reasons = [];
+
+	// 1. Shared cloud storage detection
+	if (index(h, ".cos.") >= 0 || index(h, ".myqcloud.com") >= 0 || index(h, ".aliyuncs.com") >= 0 ||
+	    index(h, ".s3.") >= 0 || index(h, "amazonaws.com") >= 0 || index(h, "r2.cloudflarestorage.com") >= 0) {
+		push(tags, { text: "共用云存储", type: "neutral" });
+		let bucket = split(h, ".")[0] || h;
+		if (index(h, "myqcloud.com") >= 0) {
+			push(notes, "腾讯云对象存储 (COS)：很多公司共用的主机名。从名字只能知道是哪家的存储服务，不知道数据是谁的。桶名“" + bucket + "”只能当作线索。");
+		} else if (index(h, "aliyuncs.com") >= 0) {
+			push(notes, "阿里云对象存储 (OSS)：很多公司共用的云存储桶。桶名“" + bucket + "”可作为判断归属应用的线索。");
+		} else {
+			push(notes, "公有云对象存储服务：多个应用可能共用此类存储域名，子域名前缀“" + bucket + "”是识别归属的主要线索。");
+		}
+	}
+
+	// 2. Input method / keyboard naming heuristics
+	if (index(h, "wxkb") >= 0 || substr(h, 0, 4) == "ime." || index(h, ".ime.") >= 0 || index(h, "-ime") >= 0 || index(h, "input") >= 0 || index(h, "sogou") >= 0 || index(h, "iflytek") >= 0) {
+		push(tags, { text: "名字像输入法", type: "warn" });
+		suspicious_score += 40;
+		push(suspicious_reasons, "名字像输入法");
+		if (index(h, "wxkb") >= 0) {
+			push(notes, "名字里有“wxkb”，看起来像微信输入法 (WeChat Keyboard) 或键盘相关的云端服务。这只是根据名字猜的。");
+		} else {
+			push(notes, "域名中包含输入法相关特征词，可能涉及输入法词库同步、语音识别或剪贴板/遥测上传。");
+		}
+	}
+
+	// 3. Unencrypted traffic detection
+	if (h_entry. encrypted === false) {
+		push(tags, { text: "未加密", type: "warn" });
+		suspicious_score += 35;
+		push(suspicious_reasons, "存在未加密明文传输");
+		push(notes, "检测到未使用 TLS/HTTPS 的明文连接（端口或协议未加密），传输内容可能被网络中间节点窥探。");
+	}
+
+	// 4. Telemetry / logging heuristics
+	if (index(h, "metrics") >= 0 || index(h, "telemetry") >= 0 || index(h, "beacon") >= 0 || index(h, "collect") >= 0 ||
+	    index(h, "nel.") >= 0 || index(h, "stat") >= 0 || index(h, "log") >= 0 || index(h, "user-data") >= 0) {
+		push(tags, { text: "遥测或日志", type: "info" });
+		suspicious_score += 15;
+		push(notes, "域名特征包含遥测/指标上报关键词（如 metrics/user-data/nel），通常用于后台收集设备诊断或行为数据。");
+	}
+
+	// 5. Large single-connection upload or high upload volume
+	if ((h_entry.max_single_up || 0) >= 5 * 1024 * 1024 || (h_entry.up || 0) >= 10 * 1024 * 1024) {
+		suspicious_score += 50;
+		push(suspicious_reasons, "大额单次上传");
+	} else if ((h_entry.up || 0) >= 1024 * 1024 && (h_entry.up || 0) > (h_entry.down || 1) * 3) {
+		suspicious_score += 30;
+		push(suspicious_reasons, "上传显著高于下载");
+	}
+
+	// 6. Night-time upload
+	if ((h_entry.night_up || 0) >= 100 * 1024) {
+		suspicious_score += 25;
+		push(suspicious_reasons, "存在夜间上传");
+	}
+
+	if (length(notes) == 0) {
+		push(notes, "路由器上的名单里没有这个网站的特殊风险说明。可通过连接频次、单次最大上传量和夜间活跃度判断其行为是否符合预期。");
+	} else {
+		unshift(notes, "路由器上的名单里没有这个网站的说明。");
+	}
+
+	return {
+		tags,
+		notes,
+		suspicious_score,
+		suspicious_reasons
+	};
+}
+
+// Record a connection sample into history
+function record_flow_sample(src_ip, host, dst_ip, dst_port, proto, delta_up, delta_down, total_conn_up, is_new_conn, encrypted, dpi_app, dpi_proto, device_total_bps) {
+	if (!host || host == "") host = dst_ip || "unknown";
+	// Ignore local router accesses
+	if (substr(host, 0, 10) == "192.168.8." || host == "127.0.0.1" || substr(host, 0, 8) == "198.18.0") return;
+
+	let now = time();
+	let dp = get_date_parts(now);
+	if (history.today_date != dp.date_str) {
+		history.today_date = dp.date_str;
+		history.today_up = 0;
+		history.today_down = 0;
+	}
+	history.today_up += delta_up;
+	history.today_down += delta_down;
+
+	let h_entry = history.hosts[host];
+	if (!h_entry) {
+		let gid = classify_host(host, dpi_app);
+		h_entry = {
+			host: host,
+			group_id: gid,
+			provider: get_provider_hint(host),
+			up: 0,
+			down: 0,
+			conn_count: 0,
+			max_single_up: 0,
+			night_up: 0,
+			idle_up: 0,
+			encrypted: (encrypted !== false),
+			dpi_app: dpi_app || "",
+			dpi_proto: dpi_proto || (dst_port == 443 ? "TLS" : (dst_port == 80 ? "HTTP" : proto)),
+			first_seen: now,
+			last_seen: now,
+			active_hours: {},
+			big_hours: {},
+			devices: {}
+		};
+		history.hosts[host] = h_entry;
+	}
+
+	h_entry.up += delta_up;
+	h_entry.down += delta_down;
+	h_entry.last_seen = now;
+	if (is_new_conn) h_entry.conn_count += 1;
+	if (total_conn_up > (h_entry.max_single_up || 0)) {
+		h_entry.max_single_up = total_conn_up;
+	}
+	if (encrypted === false) {
+		h_entry.encrypted = false;
+	}
+	if (dpi_app && dpi_app != "Unknown" && !h_entry.dpi_app) {
+		h_entry.dpi_app = dpi_app;
+		h_entry.group_id = classify_host(host, dpi_app);
+	}
+	if (dpi_proto && dpi_proto != "Unknown") {
+		h_entry.dpi_proto = dpi_proto;
+	}
+
+	if (dp.is_night && delta_up > 0) {
+		h_entry.night_up = (h_entry.night_up || 0) + delta_up;
+	}
+	// If device overall interactive traffic is very low (< 5 KB/s) or night time, count as idle upload
+	if (delta_up > 0 && (dp.is_night || (device_total_bps || 0) < 5120)) {
+		h_entry.idle_up = (h_entry.idle_up || 0) + delta_up;
+	}
+
+	// Track active hour
+	if (delta_up > 0 || delta_down > 0 || is_new_conn) {
+		let ah = h_entry.active_hours[dp.hour_str];
+		if (!ah) {
+			ah = { up: 0, down: 0, max_up: 0 };
+			h_entry.active_hours[dp.hour_str] = ah;
+		}
+		ah.up += delta_up;
+		ah.down += delta_down;
+		if (total_conn_up > ah.max_up) ah.max_up = total_conn_up;
+		if (total_conn_up >= 1024 * 1024) {
+			h_entry.big_hours[dp.hour_str] = ah.up;
+		}
+	}
+
+	// Track per-device stats for this host
+	let dev_entry = h_entry.devices[src_ip];
+	if (!dev_entry) {
+		dev_entry = { ip: src_ip, up: 0, down: 0, conn_count: 0, max_single_up: 0, night_up: 0, idle_up: 0, last_seen: now };
+		h_entry.devices[src_ip] = dev_entry;
+	}
+	dev_entry.up += delta_up;
+	dev_entry.down += delta_down;
+	dev_entry.last_seen = now;
+	if (is_new_conn) dev_entry.conn_count += 1;
+	if (total_conn_up > dev_entry.max_single_up) dev_entry.max_single_up = total_conn_up;
+	if (dp.is_night && delta_up > 0) dev_entry.night_up += delta_up;
+}
+
+// Parse netifyd JSON line
+function handle_netify_line(line) {
+	if (!line || length(line) < 2 || substr(line, 0, 1) != "{") return;
+	let msg = null;
+	try {
+		msg = json(line);
+	} catch (e) {
+		return;
+	}
+	if (!msg || !msg.type) return;
+
+	if (msg.type == "agent_status") {
+		netify_flow_count = msg.flow_count || 0;
+		return;
+	}
+	if (msg.type == "flow" && msg.flow) {
+		let f = msg.flow;
+		let host = f.host_server_name || (f.ssl && f.ssl.client_sni) || (f.http && f.http.host) || (f.dns && f.dns.query_hostname) || "";
+		let proto_name = f.detected_protocol_name || "";
+		let app_name = f.detected_application_name || "";
+		let local_ip = f.local_ip || "";
+		let other_ip = f.other_ip || "";
+		let local_port = f.local_port || 0;
+		let other_port = f.other_port || 0;
+
+		let src_ip = "";
+		let dst_ip = "";
+		let src_port = 0;
+		let dst_port = 0;
+		if (substr(local_ip, 0, 10) == "192.168.8." && local_ip != "192.168.8.1") {
+			src_ip = local_ip; src_port = local_port;
+			dst_ip = other_ip; dst_port = other_port;
+		} else if (substr(other_ip, 0, 10) == "192.168.8." && other_ip != "192.168.8.1") {
+			src_ip = other_ip; src_port = other_port;
+			dst_ip = local_ip; dst_port = local_port;
+		} else {
+			return;
+		}
+
+		// Determine if encrypted
+		let encrypted = true;
+		let up_proto = uc(proto_name);
+		if (up_proto == "HTTP" || up_proto == "MQTT" || dst_port == 80 || dst_port == 8080 || (dst_port != 443 && dst_port != 123 && dst_port != 53 && up_proto != "TLS" && up_proto != "QUIC" && up_proto != "HTTPS" && up_proto != "SSH" && up_proto != "DNS" && up_proto != "NTP" && !f.ssl)) {
+			encrypted = false;
+		}
+
+		let info = {
+			host: host,
+			app: app_name,
+			proto: proto_name,
+			encrypted: encrypted,
+			dst_ip: dst_ip,
+			dst_port: dst_port,
+			ts: time()
+		};
+		dpi_flows[src_ip + ":" + src_port] = info;
+		if (host != "" && substr(dst_ip, 0, 7) != "198.18.") {
+			dpi_flows[dst_ip + ":" + dst_port] = info;
+		}
+		if (host != "") {
+			dpi_flows["host:" + lc(host)] = info;
+		}
+	}
+}
+
+// Maintain non-blocking connection to netifyd socket
+let netify_sock = null;
+let netify_handle = null;
+let netify_buf = "";
+
+function connect_netify() {
+	if (netify_sock) return;
+	let s = socket.connect(NETIFY_SOCK);
+	if (!s) {
+		netify_connected = false;
+		return;
+	}
+	netify_sock = s;
+	netify_connected = true;
+	netify_buf = "";
+	netify_handle = uloop.handle(s, function(flags) {
+		let chunk = netify_sock.recv(32768);
+		if (!chunk || length(chunk) == 0) {
+			if (netify_handle) netify_handle.delete();
+			netify_handle = null;
+			netify_sock.close();
+			netify_sock = null;
+			netify_connected = false;
+			return;
+		}
+		netify_buf += chunk;
+		let lines = split(netify_buf, "\n");
+		netify_buf = pop(lines);
+		for (let line in lines) {
+			handle_netify_line(trim(line));
+		}
+	}, uloop.ULOOP_READ);
+}
+
+// Fetch mihomo connections via local socket
+function fetch_mihomo_connections() {
+	let s = socket.connect("127.0.0.1", 9090);
+	if (!s) return [];
+	s.send("GET /connections HTTP/1.0\r\nHost: 127.0.0.1:9090\r\nConnection: close\r\n\r\n");
+	let resp = "";
+	while (true) {
+		let c = s.recv(65536);
+		if (!c || length(c) == 0) break;
+		resp += c;
+	}
+	s.close();
+	let idx = index(resp, "\r\n\r\n");
+	if (idx < 0) return [];
+	let parsed = null;
+	try {
+		parsed = json(substr(resp, idx + 4));
+	} catch (e) {
+		parsed = null;
+	}
+	return (parsed && type(parsed.connections) == "array") ? parsed.connections : [];
+}
+
+// Poll conntrack for direct flows that bypass mihomo
+function fetch_conntrack_direct(mihomo_ports) {
+	let raw = fs.readfile("/proc/net/nf_conntrack");
+	if (!raw) return [];
+	let list = [];
+	for (let line in split(raw, "\n")) {
+		if (index(line, "src=192.168.8.") < 0) continue;
+		let m_src = match(line, /src=(192\.168\.8\.[0-9]+) dst=([0-9.]+) sport=([0-9]+) dport=([0-9]+) packets=[0-9]+ bytes=([0-9]+) .* src=[0-9.]+ dst=[0-9.]+ sport=[0-9]+ dport=[0-9]+ packets=[0-9]+ bytes=([0-9]+)/);
+		if (!m_src) continue;
+		let src_ip = m_src[1];
+		let dst_ip = m_src[2];
+		let sport = int(m_src[3]);
+		let dport = int(m_src[4]);
+		let up_bytes = int(m_src[5]);
+		let down_bytes = int(m_src[6]);
+
+		if (src_ip == "192.168.8.1" || dst_ip == "192.168.8.1" || substr(dst_ip, 0, 7) == "198.18.") continue;
+		if (mihomo_ports[src_ip + ":" + sport]) continue;
+
+		let proto = (index(line, "tcp") >= 0) ? "tcp" : "udp";
+		let dpi = dpi_flows[src_ip + ":" + sport] || dpi_flows[dst_ip + ":" + dport];
+		let host = (dpi && dpi.host != "") ? dpi.host : dst_ip;
+		let encrypted = dpi ? dpi.encrypted : (dport == 443 || dport == 22 || dport == 853);
+		push(list, {
+			id: "ct:" + proto + ":" + src_ip + ":" + sport + ":" + dst_ip + ":" + dport,
+			src_ip: src_ip,
+			src_port: sport,
+			dst_host: host,
+			dst_ip: dst_ip,
+			dst_port: dport,
+			proto: proto,
+			up: up_bytes,
+			down: down_bytes,
+			encrypted: encrypted,
+			dpi_app: dpi ? dpi.app : "",
+			dpi_proto: dpi ? dpi.proto : uc(proto),
+			rule: "DIRECT"
+		});
+	}
+	return list;
+}
+
+let last_tick_ms = 0;
+let save_counter = 0;
+
+function now_ms() {
+	let tv = uloop.interval ? time() * 1000 : time() * 1000;
+	return tv;
+}
+
+// Main 2-second sampling loop
+function sample_traffic() {
+	connect_netify();
+	refresh_devices();
+
+	let now = time();
+	let dt = (last_tick_ms > 0 && (now - last_tick_ms) > 0) ? (now - last_tick_ms) : 2;
+	last_tick_ms = now;
+
+	let mh_conns = fetch_mihomo_connections();
+	let mihomo_ports = {};
+	let current_conns = {};
+	let live_conns_list = [];
+
+	// Normalize mihomo connections
+	for (let c in mh_conns) {
+		let md = c.metadata || {};
+		let src_ip = md.sourceIP || "";
+		if (!get_device_info(src_ip)) continue;
+
+		let sport = int(md.sourcePort || 0);
+		let dport = int(md.destinationPort || 0);
+		mihomo_ports[src_ip + ":" + sport] = true;
+
+		let host = md.sniffHost || md.host || md.destinationIP || md.remoteDestination || "unknown";
+		let dst_ip = md.remoteDestination || md.destinationIP || "";
+		let dpi = dpi_flows[src_ip + ":" + sport] || dpi_flows["host:" + lc(host)];
+		if ((host == "" || host == "unknown" || substr(host, 0, 7) == "198.18.") && dpi && dpi.host) {
+			host = dpi.host;
+		}
+		let encrypted = true;
+		if (dport == 80 || dport == 8080 || (dport != 123 && dport != 53 && dpi && dpi.encrypted === false)) {
+			encrypted = false;
+		}
+
+		let cid = "mh:" + c.id;
+		current_conns[cid] = {
+			id: cid,
+			src_ip: src_ip,
+			src_port: sport,
+			dst_host: host,
+			dst_ip: dst_ip,
+			dst_port: dport,
+			proto: md.network || "tcp",
+			up: int(c.upload || 0),
+			down: int(c.download || 0),
+			encrypted: encrypted,
+			dpi_app: dpi ? dpi.app : "",
+			dpi_proto: dpi ? dpi.proto : (dport == 443 ? "TLS" : uc(md.network || "TCP")),
+			chain: (type(c.chains) == "array" && length(c.chains) > 0) ? c.chains[0] : "DIRECT",
+			start: c.start || ""
+		};
+	}
+
+	// Add direct conntrack connections
+	let ct_conns = fetch_conntrack_direct(mihomo_ports);
+	for (let c in ct_conns) {
+		if (!get_device_info(c.src_ip)) continue;
+		current_conns[c.id] = c;
+	}
+
+	// First pass: compute per-device live speeds
+	let dev_stats = {};
+	for (let ip, d in dhcp_devices) {
+		dev_stats[ip] = {
+			ip: ip,
+			name: d.name,
+			mac: d.mac,
+			icon: d.icon,
+			up_bps: 0,
+			down_bps: 0,
+			conn_count: 0,
+			active: false
+		};
+	}
+
+	let conn_deltas = {};
+	for (let cid, c in current_conns) {
+		let prev = prev_conns[cid];
+		let is_new = !prev;
+		let dup = 0;
+		let ddown = 0;
+		if (prev) {
+			dup = (c.up >= prev.up) ? (c.up - prev.up) : c.up;
+			ddown = (c.down >= prev.down) ? (c.down - prev.down) : c.down;
+		} else {
+			dup = c.up;
+			ddown = c.down;
+		}
+		let up_bps = int(dup / dt);
+		let down_bps = int(ddown / dt);
+		conn_deltas[cid] = { dup, ddown, up_bps, down_bps, is_new };
+
+		let dinfo = get_device_info(c.src_ip);
+		if (dinfo) {
+			if (!dev_stats[c.src_ip]) {
+				dev_stats[c.src_ip] = { ip: c.src_ip, name: dinfo.name, mac: dinfo.mac, icon: dinfo.icon, up_bps: 0, down_bps: 0, conn_count: 0, active: false };
+			}
+			dev_stats[c.src_ip].up_bps += up_bps;
+			dev_stats[c.src_ip].down_bps += down_bps;
+			dev_stats[c.src_ip].conn_count += 1;
+			if (up_bps > 0 || down_bps > 0) dev_stats[c.src_ip].active = true;
+		}
+	}
+
+	// Second pass: record into history & build live group stats
+	let live_groups = {};
+	let router_up_bps = 0;
+	let router_down_bps = 0;
+
+	for (let cid, c in current_conns) {
+		let delta = conn_deltas[cid];
+		let dev_bps = dev_stats[c.src_ip] ? (dev_stats[c.src_ip].up_bps + dev_stats[c.src_ip].down_bps) : 0;
+
+		record_flow_sample(
+			c.src_ip, c.dst_host, c.dst_ip, c.dst_port, c.proto,
+			delta.dup, delta.ddown, c.up, delta.is_new,
+			c.encrypted, c.dpi_app, c.dpi_proto, dev_bps
+		);
+
+		router_up_bps += delta.up_bps;
+		router_down_bps += delta.down_bps;
+
+		let gid = classify_host(c.dst_host, c.dpi_app);
+		let gmeta = SERVICE_GROUPS[gid] || SERVICE_GROUPS["unknown"];
+		if (!live_groups[gid]) {
+			live_groups[gid] = {
+				id: gid,
+				name: gmeta.name,
+				badge: gmeta.badge,
+				order: gmeta.order,
+				up_bps: 0,
+				down_bps: 0,
+				conn_count: 0,
+				devices_map: {},
+				unencrypted: false,
+				suspicious: false,
+				warning_badge: ""
+			};
+		}
+		let lg = live_groups[gid];
+		lg.up_bps += delta.up_bps;
+		lg.down_bps += delta.down_bps;
+		lg.conn_count += 1;
+		lg.devices_map[c.src_ip] = true;
+		if (!c.encrypted) {
+			lg.unencrypted = true;
+			lg.warning_badge = "未加密";
+		}
+
+		let dinfo = get_device_info(c.src_ip);
+		push(live_conns_list, {
+			id: cid,
+			device_ip: c.src_ip,
+			device_name: dinfo ? dinfo.name : c.src_ip,
+			host: c.dst_host,
+			dst_ip: c.dst_ip,
+			dst_port: c.dst_port,
+			proto: c.dpi_proto || uc(c.proto),
+			group_id: gid,
+			group_name: gmeta.name,
+			up_bps: delta.up_bps,
+			down_bps: delta.down_bps,
+			total_up: c.up,
+			total_down: c.down,
+			encrypted: c.encrypted,
+			chain: c.chain || "DIRECT"
+		});
+	}
+
+	prev_conns = current_conns;
+
+	// Also merge historical groups so destinations seen earlier today appear in the topology (even if currently idle)
+	let alerts = [];
+	let alert_groups_seen = {};
+	for (let hname, hentry in history.hosts) {
+		let gid = hentry.group_id || classify_host(hname, hentry.dpi_app);
+		hentry.group_id = gid;
+		let gmeta = SERVICE_GROUPS[gid] || SERVICE_GROUPS["unknown"];
+		if (!live_groups[gid]) {
+			live_groups[gid] = {
+				id: gid,
+				name: gmeta.name,
+				badge: gmeta.badge,
+				order: gmeta.order,
+				up_bps: 0,
+				down_bps: 0,
+				conn_count: 0,
+				devices_map: {},
+				unencrypted: false,
+				suspicious: false,
+				warning_badge: ""
+			};
+		}
+		let lg = live_groups[gid];
+		let heur = evaluate_host_heuristics(hentry);
+		if (hentry.encrypted === false) {
+			lg.unencrypted = true;
+			if (!lg.warning_badge) lg.warning_badge = "未加密";
+		}
+		if (heur.suspicious_score >= 35) {
+			lg.suspicious = true;
+			if (!lg.warning_badge && length(heur.tags) > 0) {
+				lg.warning_badge = heur.tags[0].text;
+			}
+			if (!alert_groups_seen[gid]) {
+				alert_groups_seen[gid] = true;
+				push(alerts, {
+					group_id: gid,
+					group_name: gmeta.name,
+					host: hname,
+					score: heur.suspicious_score,
+					reasons: heur.suspicious_reasons,
+					max_single_up: hentry.max_single_up,
+					up: hentry.up
+				});
+			}
+		}
+	}
+
+	// Format devices array sorted by active speed then historical traffic
+	let devices_arr = [];
+	let active_dev_count = 0;
+	for (let ip, ds in dev_stats) {
+		// Check if device has any connections or history
+		let has_hist = false;
+		for (let hname, hentry in history.hosts) {
+			if (hentry.devices && hentry.devices[ip]) {
+				has_hist = true;
+				break;
+			}
+		}
+		if (ds.conn_count == 0 && !has_hist && ip != "192.168.8.245" && ip != "192.168.8.208") continue;
+		if (ds.up_bps > 0 || ds.down_bps > 0) active_dev_count += 1;
+		push(devices_arr, ds);
+	}
+	sort(devices_arr, function(a, b) {
+		return ((b.up_bps + b.down_bps) - (a.up_bps + a.down_bps)) || (b.conn_count - a.conn_count);
+	});
+
+	// Format groups array sorted by active speed then order
+	let groups_arr = [];
+	let active_group_count = 0;
+	for (let gid, lg in live_groups) {
+		let dev_list = keys(lg.devices_map);
+		delete lg.devices_map;
+		lg.device_count = length(dev_list);
+		lg.devices = dev_list;
+		if (lg.up_bps > 0 || lg.down_bps > 0) active_group_count += 1;
+		push(groups_arr, lg);
+	}
+	sort(groups_arr, function(a, b) {
+		let a_act = (a.up_bps + a.down_bps > 0) ? 1 : 0;
+		let b_act = (b.up_bps + b.down_bps > 0) ? 1 : 0;
+		if (a_act != b_act) return b_act - a_act;
+		if ((b.up_bps + b.down_bps) != (a.up_bps + a.down_bps)) return (b.up_bps + b.down_bps) - (a.up_bps + a.down_bps);
+		return a.order - b.order;
+	});
+
+	// Sort live connections by speed + total upload
+	sort(live_conns_list, function(a, b) {
+		return ((b.up_bps + b.down_bps) - (a.up_bps + a.down_bps)) || (b.total_up - a.total_up);
+	});
+
+	sort(alerts, function(a, b) {
+		return b.score - a.score;
+	});
+
+	let live_payload = {
+		version: VERSION,
+		ui_version: VERSION + "-1",
+		timestamp: now,
+		netify_connected: netify_connected,
+		netify_flows: netify_flow_count,
+		router: {
+			up_bps: router_up_bps,
+			down_bps: router_down_bps,
+			active_devices: active_dev_count,
+			total_devices: length(devices_arr),
+			active_groups: active_group_count,
+			total_groups: length(groups_arr),
+			today_up: history.today_up,
+			today_down: history.today_down,
+			total_connections: length(live_conns_list),
+			status_text: "实时数据正常"
+		},
+		alerts: alerts,
+		devices: devices_arr,
+		groups: groups_arr,
+		connections: slice(live_conns_list, 0, 150)
+	};
+
+	save_json_file(LIVE_FILE, live_payload);
+
+	// Cleanup stale DPI cache every minute & persist history
+	save_counter += 1;
+	if (save_counter % 5 == 0) {
+		save_json_file(HIST_TMP_FILE, history);
+	}
+	if (save_counter >= 60) {
+		save_counter = 0;
+		for (let k, v in dpi_flows) {
+			if (now - v.ts > 300) delete dpi_flows[k];
+		}
+		save_json_file(HIST_ETC_FILE, history);
+	}
+}
+
+// Seed initial history from current mihomo active connections on startup
+uloop.init();
+sample_traffic();
+save_json_file(HIST_TMP_FILE, history);
+
+let timer = null;
+function tick() {
+	sample_traffic();
+	timer.set(2000);
+}
+timer = uloop.timer(2000, tick);
+
+uloop.run();

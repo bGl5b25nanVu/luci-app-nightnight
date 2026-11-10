@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<title>NightNight · 设备流量与隐私审计</title>
+	<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+	<div class="nn-container">
+		<!-- Top Alert Banner -->
+		<div id="nn-alert-banner" class="nn-alert-banner" style="display:none;">
+			<span id="nn-alert-text">有 1 个去向值得看一眼：微信</span>
+			<button id="nn-alert-btn" class="nn-alert-btn">查看</button>
+		</div>
+
+		<!-- Top Bar: Legend & Navigation -->
+		<div class="nn-topbar">
+			<div class="nn-legend">
+				<span><i class="nn-dot up"></i>上传（发出去）</span>
+				<span><i class="nn-dot down"></i>下载（收进来）</span>
+				<span>线越粗，速度越快</span>
+			</div>
+			<div class="nn-nav">
+				<button class="nn-tab active" data-view="topology">实时拓扑</button>
+				<button class="nn-tab" data-view="hosts">去向主机名</button>
+				<button class="nn-tab" data-view="inspect">查网站</button>
+			</div>
+		</div>
+
+		<!-- VIEW 1: Real-time Topology Flow Diagram (Screenshot 1) -->
+		<div id="view-topology" class="nn-view">
+			<div class="nn-topology-wrap" id="nn-topology-wrap">
+				<svg id="nn-svg-layer" class="nn-svg-layer"></svg>
+
+				<!-- Left Column: Devices -->
+				<div class="nn-col" id="nn-col-devices">
+					<div class="nn-col-title">设备 · 谁在用</div>
+					<div id="nn-devices-list" style="display:flex;flex-direction:column;gap:12px;"></div>
+				</div>
+
+				<!-- Center Column: Router -->
+				<div class="nn-col nn-col-center">
+					<div class="nn-router-card" id="nn-router-card">
+						<div class="nn-router-header">
+							<div class="nn-icon-box">
+								<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+									<rect x="2" y="14" width="20" height="6" rx="2"></rect>
+									<path d="M6 14V10M12 14V6M18 14V10"></path>
+									<circle cx="6" cy="17" r="1"></circle>
+									<circle cx="10" cy="17" r="1"></circle>
+								</svg>
+							</div>
+							<span class="nn-router-title">路由器</span>
+						</div>
+						<div class="nn-router-speeds">
+							<div class="nn-speed-box">
+								<div class="nn-speed-label">↑ 上传</div>
+								<div class="nn-speed-val up" id="nn-router-up">0 B/s</div>
+							</div>
+							<div class="nn-speed-box">
+								<div class="nn-speed-label">↓ 下载</div>
+								<div class="nn-speed-val down" id="nn-router-down">0 B/s</div>
+							</div>
+						</div>
+						<div class="nn-router-meta">
+							<div id="nn-meta-devices">0 台设备正在传输 · 共 0 台</div>
+							<div id="nn-meta-groups">0 个去向正在传输 · 共 0 个</div>
+							<div id="nn-meta-today">今天累计 ↑ 0 B ↓ 0 B</div>
+							<div id="nn-meta-status">实时数据正常</div>
+						</div>
+					</div>
+				</div>
+
+				<!-- Right Column: Destinations -->
+				<div class="nn-col" id="nn-col-groups">
+					<div class="nn-col-title">去向 · 连到哪里</div>
+					<div id="nn-groups-list" style="display:flex;flex-direction:column;gap:11px;"></div>
+				</div>
+			</div>
+
+			<!-- Expandable Connections Detail Drawer -->
+			<div class="nn-drawer">
+				<div class="nn-drawer-header" id="nn-drawer-toggle">
+					<span id="nn-conn-summary">连接明细 · 0 条连接</span>
+					<span id="nn-drawer-arrow" style="color:#6e7781;font-size:12px;">展开 ▼</span>
+				</div>
+				<div class="nn-drawer-body" id="nn-drawer-body" style="display:none;">
+					<table class="nn-table">
+						<thead>
+							<tr>
+								<th>目标主机 / 端口</th>
+								<th>设备</th>
+								<th>分类 / 协议</th>
+								<th>实时上传</th>
+								<th>实时下载</th>
+								<th>累计上传</th>
+								<th>累计下载</th>
+							</tr>
+						</thead>
+						<tbody id="nn-conn-tbody"></tbody>
+					</table>
+				</div>
+			</div>
+		</div>
+
+		<!-- VIEW 2: Hostname Drill-down Table (Screenshot 2: 这个网站下的主机名) -->
+		<div id="view-hosts" class="nn-view" style="display:none;">
+			<div class="nn-section-title" id="nn-hosts-title">这个网站下的主机名</div>
+			<div class="nn-filter-bar" id="nn-group-chips"></div>
+			<table class="nn-table">
+				<thead>
+					<tr>
+						<th>主机名</th>
+						<th>上传 ▼</th>
+						<th>下载</th>
+						<th>连接数</th>
+						<th>最大单条连接</th>
+						<th>夜里上传</th>
+						<th>活跃</th>
+					</tr>
+				</thead>
+				<tbody id="nn-hosts-tbody"></tbody>
+			</table>
+		</div>
+
+		<!-- VIEW 3: Site Inspector (Screenshot 3: NightNight · 查网站) -->
+		<div id="view-inspect" class="nn-view" style="display:none;">
+			<div class="nn-inspect-header">
+				<h1>NightNight · 查网站</h1>
+				<p>一个网站在一段时间里的记录：每台设备给它传了多少、什么时候传的。输入名字查保存下来的历史，不只是现在正在发生的。</p>
+			</div>
+
+			<div class="nn-search-grid">
+				<div class="nn-field">
+					<label>查一个网站</label>
+					<input type="text" id="nn-inspect-input" class="nn-input" placeholder="例如 wxkb-res-1258476243.cos.ap-shanghai.myqcloud.com 或 googleapis.com" />
+				</div>
+				<div class="nn-field">
+					<label>设备</label>
+					<select id="nn-inspect-device" class="nn-select">
+						<option value="all">全部设备</option>
+					</select>
+				</div>
+				<div class="nn-field">
+					<label>天数</label>
+					<select id="nn-inspect-days" class="nn-select">
+						<option value="7">最近 7 天</option>
+						<option value="1">今天</option>
+						<option value="30">最近 30 天</option>
+					</select>
+				</div>
+				<div>
+					<button id="nn-inspect-btn" class="nn-btn-primary">搜索</button>
+				</div>
+			</div>
+
+			<div id="nn-inspect-result" style="display:none;">
+				<h2 id="nn-ins-host" style="font-size:21px;font-weight:800;margin:8px 0 14px;word-break:break-all;"></h2>
+
+				<div class="nn-kpi-grid">
+					<div class="nn-kpi-card">
+						<div class="nn-kpi-label">↑ 上传</div>
+						<div class="nn-kpi-val" id="nn-ins-up">0 B</div>
+						<div class="nn-kpi-sub" id="nn-ins-up-share">占这段时间全部上传的 0%</div>
+					</div>
+					<div class="nn-kpi-card">
+						<div class="nn-kpi-label">↓ 下载</div>
+						<div class="nn-kpi-val" id="nn-ins-down">0 B</div>
+						<div class="nn-kpi-sub" id="nn-ins-ratio">上传/下载 1×</div>
+					</div>
+					<div class="nn-kpi-card">
+						<div class="nn-kpi-label">连接数</div>
+						<div class="nn-kpi-val" id="nn-ins-conns">0</div>
+						<div class="nn-kpi-sub">&nbsp;</div>
+					</div>
+					<div class="nn-kpi-card">
+						<div class="nn-kpi-label">活跃</div>
+						<div class="nn-kpi-val" id="nn-ins-days">1 天</div>
+						<div class="nn-kpi-sub" id="nn-ins-hours">共 1 个小时</div>
+					</div>
+				</div>
+
+				<div class="nn-behavior-box">
+					<h2>它在干什么？</h2>
+					<div class="nn-behavior-desc" id="nn-ins-behavior"></div>
+
+					<table class="nn-kv-table">
+						<tbody>
+							<tr>
+								<td>上传 / 下载</td>
+								<td id="nn-ins-kv-updown"></td>
+							</tr>
+							<tr>
+								<td>连接数</td>
+								<td id="nn-ins-kv-conns"></td>
+							</tr>
+							<tr>
+								<td>最大的单条连接（累计）</td>
+								<td id="nn-ins-kv-max"></td>
+							</tr>
+							<tr>
+								<td>活跃</td>
+								<td id="nn-ins-kv-active"></td>
+							</tr>
+							<tr>
+								<td>夜里上传</td>
+								<td id="nn-ins-kv-night"></td>
+							</tr>
+							<tr>
+								<td>设备空闲时上传</td>
+								<td id="nn-ins-kv-idle"></td>
+							</tr>
+						</tbody>
+					</table>
+
+					<div class="nn-notes-box" id="nn-ins-notes"></div>
+				</div>
+			</div>
+		</div>
+
+		<!-- Footer -->
+		<div class="nn-footer">
+			<div>
+				NightNight · 界面 0.6.0-1 · 后台服务 0.6.0 ·
+				<a id="nn-seed-demo-link" title="加载或刷新推文同款微信输入法审计样本">加载推文样本演示</a>
+			</div>
+			<div>
+				<span id="nn-netify-badge" style="color:#1a7f37;">● DPI (netifyd) + Mihomo + Conntrack 运行中</span>
+			</div>
+		</div>
+	</div>
+
+	<script src="app.js"></script>
+</body>
+</html>
