@@ -248,7 +248,9 @@ function classify_host(host, dpi_app, dst_port) {
 	}
 	if (index(h, "feishu.cn") >= 0 || index(h, "feishucdn.com") >= 0 || index(h, "bytedance.com") >= 0 ||
 	    index(h, "byteimg.com") >= 0 || index(h, "snssdk.com") >= 0 || index(h, "douyin.com") >= 0 ||
-	    index(h, "doubao.com") >= 0 || index(h, "volces.com") >= 0 || index(h, "zijieapi.com") >= 0) {
+	    index(h, "doubao.com") >= 0 || index(h, "volces.com") >= 0 || index(h, "zijieapi.com") >= 0 ||
+	    index(h, "tiktokv.com") >= 0 || index(h, "tiktokcdn.com") >= 0 || index(h, "byteeffect") >= 0 ||
+	    index(app, "tiktok") >= 0 || index(app, "bytedance") >= 0) {
 		return "feishu";
 	}
 
@@ -271,15 +273,16 @@ function classify_host(host, dpi_app, dst_port) {
 	    index(h, "oaiusercontent.com") >= 0 || index(h, "openrouter.ai") >= 0 || index(h, "deepseek.com") >= 0 ||
 	    index(h, "grok.com") >= 0 || index(h, "anthropic.com") >= 0 || index(h, "claude.ai") >= 0 ||
 	    index(h, "opencode.ai") >= 0 || index(h, "muse.ai") >= 0 || index(h, "workbuddy.ai") >= 0 ||
-	    index(h, "agentbell.app") >= 0 || index(h, "metaaivm.com") >= 0 || index(h, "usemagpie.ai") >= 0 ||
+	    index(h, "agentbell.app") >= 0 || index(h, "metaaivm.com") >= 0 || index(h, "meta.ai") >= 0 || index(h, "usemagpie.ai") >= 0 ||
 	    index(h, "raycast.com") >= 0 || index(h, "ray.so") >= 0 ||
 	    substr(h, 0, 7) == "20.213." || substr(h, 0, 8) == "172.207." || substr(h, 0, 6) == "4.217.") {
 		return "openai";
 	}
 
-	// 8. Google
+	// 8. Google / Android
 	if (index(h, "google.com") >= 0 || index(h, "googleapis.com") >= 0 || index(h, "gstatic.com") >= 0 ||
-	    index(h, "googleusercontent.com") >= 0 || index(h, "youtube.com") >= 0 ||
+	    index(h, "googleusercontent.com") >= 0 || index(h, "youtube.com") >= 0 || index(h, "android.com") >= 0 ||
+	    substr(h, 0, 11) == "216.239.35." || substr(h, 0, 7) == "34.102." ||
 	    index(app, "google") >= 0 || index(app, "youtube") >= 0) {
 		return "google";
 	}
@@ -299,9 +302,9 @@ function classify_host(host, dpi_app, dst_port) {
 		return "jd";
 	}
 
-	// 11. China Merchants Securities (招商证券 / 一户通客户端直连专线 & 行情服务)
+	// 11. China Merchants Securities & Securities Trading (招商证券 / 富途 / 行情服务)
 	if (index(h, "cmschina.com") >= 0 || index(h, "newone.com.cn") >= 0 || index(h, "sseinfo.com") >= 0 ||
-	    index(h, "yundzh.com") >= 0 || index(h, "cninfo.com.cn") >= 0 ||
+	    index(h, "yundzh.com") >= 0 || index(h, "cninfo.com.cn") >= 0 || index(h, "futunn.com") >= 0 ||
 	    substr(h, 0, 12) == "114.141.177." || substr(h, 0, 11) == "210.21.237." ||
 	    h == "120.79.73.168" || substr(h, 0, 9) == "14.21.47." || substr(h, 0, 11) == "10.254.247." ||
 	    port == 22016 || port == 22017 || port == 7731 || port == 7706 || port == 7717) {
