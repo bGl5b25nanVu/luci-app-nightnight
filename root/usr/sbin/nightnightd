@@ -30,7 +30,11 @@ fs.mkdir(ETC_DIR);
 
 // State structures
 let custom_devices = {};
-let dhcp_devices = {}; // ip -> { mac, name, icon }
+let uci_devices = {}; // ip or mac -> { name, icon }
+let mdns_names = {};  // ip -> resolved mDNS hostname
+let mdns_queried_at = {}; // ip -> timestamp of last mDNS query
+let arp_online = {};  // ip -> true if ARP Flags == 0x2 (REACHABLE/STALE)
+let dhcp_devices = {}; // ip -> { ip, mac, name, icon, online }
 let mac_to_ip = {};
 
 // Active connection tracking: conn_id -> { src_ip, dst_host, dst_ip, dst_port, proto, up, down, start_ts, encrypted, dpi_app, dpi_proto }
@@ -71,14 +75,61 @@ function save_json_file(path, data) {
 	fs.rename(tmp, path);
 }
 
+function guess_device_icon(name) {
+	let ln = lc(name || "");
+	if (index(ln, "mac") >= 0 || index(ln, "pc") >= 0 || index(ln, "desktop") >= 0 ||
+	    index(ln, "laptop") >= 0 || index(ln, "win") >= 0 || index(ln, "book") >= 0 ||
+	    index(ln, "ubuntu") >= 0 || index(ln, "linux") >= 0 || index(ln, "server") >= 0 || index(ln, "nas") >= 0) {
+		return "laptop";
+	}
+	return "phone";
+}
+
+function normalize_device_name(name) {
+	if (!name) return "";
+	let clean = trim(replace(name, /\.local\.?$/i, ""));
+	let key = lc(replace(clean, /[-_\s]/g, ""));
+	if (key == "macbookpro") return "MacBook-Pro";
+	if (key == "macbookair") return "MacBook-Air";
+	if (key == "macmini") return "Mac-mini";
+	if (key == "macstudio") return "Mac-Studio";
+	return clean;
+}
+
+function is_unnamed_label(name) {
+	if (!name || name == "*" || name == "unknown") return true;
+	if (substr(name, 0, length("未命名设备")) == "未命名设备") return true;
+	if (substr(name, 0, length("未知设备")) == "未知设备") return true;
+	return false;
+}
+
+// Parse UCI /etc/config/dhcp static host sections
+function load_uci_dhcp_hosts() {
+	let raw = fs.readfile("/etc/config/dhcp") || "";
+	let blocks = split(raw, /config\s+host/);
+	for (let i = 1; i < length(blocks); i++) {
+		let b = blocks[i];
+		let m_name = match(b, /option\s+name\s+'([^']+)'/);
+		let m_ip = match(b, /option\s+ip\s+'([^']+)'/);
+		let m_mac = match(b, /option\s+mac\s+'([^']+)'/);
+		if (m_name && m_name[1]) {
+			let dname = normalize_device_name(m_name[1]);
+			let dicon = guess_device_icon(dname);
+			if (m_ip && m_ip[1]) uci_devices[m_ip[1]] = { name: dname, icon: dicon };
+			if (m_mac && m_mac[1]) uci_devices[lc(m_mac[1])] = { name: dname, icon: dicon };
+		}
+	}
+}
+load_uci_dhcp_hosts();
+
 // Load saved custom devices & history
 let saved_devs = load_json_file(DEVICES_ETC_FILE);
 if (type(saved_devs) == "object") {
 	custom_devices = saved_devs;
 } else {
-	// Default known LAN devices on this router
 	custom_devices = {
-		"192.168.8.245": { name: "MacBook-Pro", icon: "laptop" },
+		"192.168.8.192": { name: "MacBook-Pro", icon: "laptop" },
+		"192.168.8.159": { name: "iPhone-Duo", icon: "phone" },
 		"192.168.8.208": { name: "HOP-AL00", icon: "phone" },
 		"192.168.8.194": { name: "Mac", icon: "laptop" },
 		"192.168.8.215": { name: "iMac", icon: "laptop" }
@@ -99,8 +150,254 @@ function get_date_parts(ts) {
 	return { date_str, hour_str, is_night, hour: lt.hour };
 }
 
+// Non-blocking mDNS Reverse PTR Resolver (queries <ip>:5353 & 224.0.0.251:5353 to uncover Apple/Android private Wi-Fi hostnames)
+let mdns_sock = null;
+let mdns_handle = null;
+
+function build_mdns_ptr_query(ip) {
+	let parts = split(ip, ".");
+	if (length(parts) != 4) return null;
+	let labels = [parts[3], parts[2], parts[1], parts[0], "in-addr", "arpa"];
+	let q = "\x12\x34\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00";
+	for (let l in labels) {
+		q += chr(length(l)) + l;
+	}
+	q += "\x00\x00\x0c\x00\x01";
+	return q;
+}
+
+function parse_mdns_ptr_reply(pkt) {
+	if (!pkt || length(pkt) < 20) return null;
+	let idx = index(pkt, "\x05local");
+	if (idx <= 0) return null;
+	for (let start = max(12, idx - 64); start < idx; start++) {
+		let len = ord(pkt, start);
+		if (start + 1 + len == idx && len > 0 && len < 64) {
+			let name = substr(pkt, start + 1, len);
+			if (name != "in-addr" && name != "arpa" && !match(name, /^[0-9]+$/) && match(name, /^[A-Za-z0-9._\x80-\xff-]+$/)) {
+				return normalize_device_name(name);
+			}
+		}
+	}
+	return null;
+}
+
+function init_mdns_resolver() {
+	if (mdns_sock) return;
+	mdns_sock = socket.create(socket.AF_INET, socket.SOCK_DGRAM, 0);
+	if (!mdns_sock) return;
+	mdns_handle = uloop.handle(mdns_sock, function(flags) {
+		while (true) {
+			let addr = {};
+			let data = mdns_sock.recv(512, socket.MSG_DONTWAIT, addr);
+			if (!data) break;
+			let src_ip = addr.address || "";
+			let resolved = parse_mdns_ptr_reply(data);
+			if (resolved && substr(src_ip, 0, length(LAN_PREFIX)) == LAN_PREFIX && src_ip != ROUTER_IP) {
+				let icon = guess_device_icon(resolved);
+				mdns_names[src_ip] = resolved;
+				if (dhcp_devices[src_ip]) {
+					dhcp_devices[src_ip].name = resolved;
+					dhcp_devices[src_ip].icon = icon;
+					if (dhcp_devices[src_ip].mac) {
+						custom_devices[dhcp_devices[src_ip].mac] = { name: resolved, icon: icon };
+					}
+				}
+				custom_devices[src_ip] = { name: resolved, icon: icon };
+				save_json_file(DEVICES_ETC_FILE, custom_devices);
+			}
+		}
+	}, uloop.ULOOP_READ);
+}
+
+function query_mdns_ptr(ip) {
+	if (!mdns_sock) init_mdns_resolver();
+	if (!mdns_sock || !ip) return;
+	let now = time();
+	if (mdns_queried_at[ip] && (now - mdns_queried_at[ip]) < 10) return;
+	mdns_queried_at[ip] = now;
+	let pkt = build_mdns_ptr_query(ip);
+	if (!pkt) return;
+	mdns_sock.send(pkt, 0, { address: ip, port: 5353 });
+	mdns_sock.send(pkt, 0, { address: "224.0.0.251", port: 5353 });
+}
+
+// Passive traffic & OUI fingerprinting fallback when DHCP is "*" and device hasn't answered mDNS yet
+function infer_device_from_traffic(ip, mac) {
+	let has_macos_clue = false;
+	let has_ios_clue = false;
+	let has_huawei_clue = false;
+	let has_xiaomi_clue = false;
+	let has_oppo_clue = false;
+
+	for (let hname, hentry in history.hosts) {
+		if (!hentry.devices || !hentry.devices[ip]) continue;
+		let h = lc(hname);
+		if (index(h, "daily-cloudcode-pa.googleapis.com") >= 0 || index(h, "osxapps.itunes.apple.com") >= 0 ||
+		    index(h, "raycast.com") >= 0 || index(h, "workbuddy.ai") >= 0 || index(h, "114.141.177.") >= 0 ||
+		    index(h, "cmschina.com.cn") >= 0 || index(h, "newone.com.cn") >= 0) {
+			has_macos_clue = true;
+		} else if (index(h, "ioshost.") >= 0 || index(h, "gdmf.apple.com") >= 0 || index(h, "push.apple.com") >= 0 ||
+		           index(h, "init.ess.apple.com") >= 0 || index(h, "bag.itunes.apple.com") >= 0 || index(h, "captive.apple.com") >= 0) {
+			has_ios_clue = true;
+		} else if (index(h, "dbankcloud") >= 0 || index(h, "hicloud.com") >= 0) {
+			has_huawei_clue = true;
+		} else if (index(h, "miui.com") >= 0 || index(h, "xiaomi.com") >= 0) {
+			has_xiaomi_clue = true;
+		} else if (index(h, "heytap") >= 0 || index(h, "coloros.com") >= 0 || index(h, "oppomobile.com") >= 0) {
+			has_oppo_clue = true;
+		}
+	}
+
+	let last_octet = split(ip, ".")[3] || "0";
+	if (has_macos_clue) return { name: "MacBook-Pro", icon: "laptop" };
+	if (has_ios_clue) return { name: "iPhone #" + last_octet, icon: "phone" };
+	if (has_huawei_clue) return { name: "华为设备 #" + last_octet, icon: "phone" };
+	if (has_xiaomi_clue) return { name: "小米设备 #" + last_octet, icon: "phone" };
+	if (has_oppo_clue) return { name: "OnePlus/OPPO #" + last_octet, icon: "phone" };
+	return null;
+}
+
+function resolve_device_identity(ip, mac, dhcp_name) {
+	let last_octet = split(ip, ".")[3] || "0";
+	let name = "";
+	let icon = "phone";
+
+	// 0. User-explicitly renamed device in Web UI
+	if (custom_devices[ip] && custom_devices[ip].user_set && !is_unnamed_label(custom_devices[ip].name)) {
+		name = custom_devices[ip].name;
+		icon = custom_devices[ip].icon || guess_device_icon(name);
+	}
+	else if (mac && custom_devices[mac] && custom_devices[mac].user_set && !is_unnamed_label(custom_devices[mac].name)) {
+		name = custom_devices[mac].name;
+		icon = custom_devices[mac].icon || guess_device_icon(name);
+	}
+	// 1. mDNS live response for this IP
+	else if (mdns_names[ip]) {
+		name = mdns_names[ip];
+	}
+	// 2. Explicit DHCP hostname
+	else if (dhcp_name && dhcp_name != "*") {
+		name = normalize_device_name(dhcp_name);
+	}
+	// 3. Saved learned name by MAC or IP
+	else if (mac && custom_devices[mac] && !is_unnamed_label(custom_devices[mac].name)) {
+		name = custom_devices[mac].name;
+		icon = custom_devices[mac].icon || guess_device_icon(name);
+	}
+	else if (custom_devices[ip] && !is_unnamed_label(custom_devices[ip].name)) {
+		name = custom_devices[ip].name;
+		icon = custom_devices[ip].icon || guess_device_icon(name);
+	}
+	// 4. UCI static lease by MAC or IP
+	else if (mac && uci_devices[mac]) {
+		name = uci_devices[mac].name;
+		icon = uci_devices[mac].icon;
+	}
+	else if (uci_devices[ip]) {
+		name = uci_devices[ip].name;
+		icon = uci_devices[ip].icon;
+	}
+	// 5. Passive traffic fingerprint inference
+	else {
+		let inferred = infer_device_from_traffic(ip, mac);
+		if (inferred) {
+			name = inferred.name;
+			icon = inferred.icon;
+		}
+	}
+
+	if (is_unnamed_label(name)) {
+		// Trigger non-blocking mDNS PTR query on port 5353
+		query_mdns_ptr(ip);
+		name = "设备 #" + last_octet;
+	} else {
+		icon = (custom_devices[ip] && custom_devices[ip].icon) || guess_device_icon(name);
+	}
+
+	return { name, icon };
+}
+
+// Merge duplicate offline IPs when the same named device (e.g., MacBook-Pro or iPhone) gets a new DHCP IP
+function deduplicate_and_migrate_devices() {
+	let active_by_name = {}; // norm_name -> online ip
+	for (let ip, d in dhcp_devices) {
+		if (is_unnamed_label(d.name)) continue;
+		let nkey = lc(replace(d.name, /[-_\s]/g, ""));
+		if (arp_online[ip]) {
+			active_by_name[nkey] = ip;
+		}
+	}
+
+	let migrated = false;
+	for (let ip, d in dhcp_devices) {
+		if (arp_online[ip] || is_unnamed_label(d.name)) continue;
+		let nkey = lc(replace(d.name, /[-_\s]/g, ""));
+		let new_ip = active_by_name[nkey];
+		if (new_ip && new_ip != ip) {
+			// Migrate history from old offline IP `ip` -> active `new_ip`
+			for (let hname, hentry in history.hosts) {
+				if (hentry.devices && hentry.devices[ip]) {
+					let old_d = hentry.devices[ip];
+					let new_d = hentry.devices[new_ip];
+					if (!new_d) {
+						old_d.ip = new_ip;
+						hentry.devices[new_ip] = old_d;
+					} else {
+						new_d.up = (new_d.up || 0) + (old_d.up || 0);
+						new_d.down = (new_d.down || 0) + (old_d.down || 0);
+						new_d.conn_count = (new_d.conn_count || 0) + (old_d.conn_count || 0);
+						if ((old_d.max_single_up || 0) > (new_d.max_single_up || 0)) {
+							new_d.max_single_up = old_d.max_single_up;
+						}
+						new_d.night_up = (new_d.night_up || 0) + (old_d.night_up || 0);
+						new_d.idle_up = (new_d.idle_up || 0) + (old_d.idle_up || 0);
+						if ((old_d.last_seen || 0) > (new_d.last_seen || 0)) {
+							new_d.last_seen = old_d.last_seen;
+						}
+					}
+					delete hentry.devices[ip];
+					migrated = true;
+				}
+			}
+			delete dhcp_devices[ip];
+			if (custom_devices[ip]) {
+				delete custom_devices[ip];
+				save_json_file(DEVICES_ETC_FILE, custom_devices);
+			}
+		}
+	}
+	if (migrated) {
+		save_json_file(HIST_TMP_FILE, history);
+	}
+}
+
 // Refresh DHCP leases and ARP table
 function refresh_devices() {
+	init_mdns_resolver();
+	let latest_custom = load_json_file(DEVICES_ETC_FILE);
+	if (type(latest_custom) == "object") {
+		for (let k, v in latest_custom) custom_devices[k] = v;
+	}
+	arp_online = {};
+	let arp = fs.readfile("/proc/net/arp");
+	if (arp) {
+		let lines = split(arp, "\n");
+		for (let i = 1; i < length(lines); i++) {
+			let parts = split(trim(lines[i]), /\s+/);
+			if (length(parts) >= 6 && substr(parts[0], 0, length(LAN_PREFIX)) == LAN_PREFIX) {
+				let ip = parts[0];
+				let flags = parts[2];
+				let mac = lc(parts[3]);
+				if (ip == ROUTER_IP) continue;
+				if (flags == "0x2" && mac != "00:00:00:00:00:00") {
+					arp_online[ip] = true;
+					mac_to_ip[mac] = ip;
+				}
+			}
+		}
+	}
+
 	let leases = fs.readfile("/tmp/dhcp.leases");
 	if (leases) {
 		for (let line in split(leases, "\n")) {
@@ -108,41 +405,48 @@ function refresh_devices() {
 			if (length(parts) >= 4) {
 				let mac = lc(parts[1]);
 				let ip = parts[2];
-				let name = parts[3];
+				let raw_name = parts[3];
+				if (ip == ROUTER_IP) continue;
 				mac_to_ip[mac] = ip;
-				let last_octet = split(ip, ".")[3] || "0";
-				if (!name || name == "*") {
-					name = (custom_devices[ip] && custom_devices[ip].name) ? custom_devices[ip].name : ("未命名设备 #" + last_octet);
+				let id_info = resolve_device_identity(ip, mac, raw_name);
+				dhcp_devices[ip] = {
+					ip: ip,
+					mac: mac,
+					name: id_info.name,
+					icon: id_info.icon,
+					online: !!arp_online[ip]
+				};
+				if (raw_name == "*" && arp_online[ip] && !mdns_names[ip]) {
+					query_mdns_ptr(ip);
 				}
-				let icon = "phone";
-				let ln = lc(name);
-				if (index(ln, "mac") >= 0 || index(ln, "pc") >= 0 || index(ln, "desktop") >= 0 || index(ln, "laptop") >= 0 || index(ln, "win") >= 0) {
-					icon = "laptop";
-				}
-				if (custom_devices[ip] && custom_devices[ip].icon) icon = custom_devices[ip].icon;
-				if (custom_devices[ip] && custom_devices[ip].name) name = custom_devices[ip].name;
-				dhcp_devices[ip] = { ip, mac, name, icon };
 			}
 		}
 	}
-	let arp = fs.readfile("/proc/net/arp");
+
 	if (arp) {
 		let lines = split(arp, "\n");
 		for (let i = 1; i < length(lines); i++) {
 			let parts = split(trim(lines[i]), /\s+/);
-			if (length(parts) >= 6 && substr(parts[0], 0, 10) == "192.168.8.") {
+			if (length(parts) >= 6 && substr(parts[0], 0, length(LAN_PREFIX)) == LAN_PREFIX) {
 				let ip = parts[0];
+				let flags = parts[2];
 				let mac = lc(parts[3]);
-				mac_to_ip[mac] = ip;
+				if (ip == ROUTER_IP || flags != "0x2" || mac == "00:00:00:00:00:00") continue;
 				if (!dhcp_devices[ip]) {
-					let last_octet = split(ip, ".")[3] || "0";
-					let name = (custom_devices[ip] && custom_devices[ip].name) ? custom_devices[ip].name : ("未命名设备 #" + last_octet);
-					let icon = (custom_devices[ip] && custom_devices[ip].icon) ? custom_devices[ip].icon : "phone";
-					dhcp_devices[ip] = { ip, mac, name, icon };
+					let id_info = resolve_device_identity(ip, mac, "*");
+					dhcp_devices[ip] = {
+						ip: ip,
+						mac: mac,
+						name: id_info.name,
+						icon: id_info.icon,
+						online: true
+					};
 				}
 			}
 		}
 	}
+
+	deduplicate_and_migrate_devices();
 }
 
 function get_device_info(ip) {
@@ -151,10 +455,8 @@ function get_device_info(ip) {
 	}
 	if (dhcp_devices[ip]) return dhcp_devices[ip];
 	if (substr(ip, 0, length(LAN_PREFIX)) == LAN_PREFIX) {
-		let last_octet = split(ip, ".")[3] || "0";
-		let name = (custom_devices[ip] && custom_devices[ip].name) ? custom_devices[ip].name : ("未命名设备 #" + last_octet);
-		let icon = (custom_devices[ip] && custom_devices[ip].icon) ? custom_devices[ip].icon : "phone";
-		dhcp_devices[ip] = { ip, mac: "", name, icon };
+		let id_info = resolve_device_identity(ip, "", "*");
+		dhcp_devices[ip] = { ip, mac: "", name: id_info.name, icon: id_info.icon, online: !!arp_online[ip] };
 		return dhcp_devices[ip];
 	}
 	return null;
@@ -799,6 +1101,7 @@ function sample_traffic() {
 			name: d.name,
 			mac: d.mac,
 			icon: d.icon,
+			online: !!arp_online[ip],
 			up_bps: 0,
 			down_bps: 0,
 			conn_count: 0,
@@ -826,11 +1129,12 @@ function sample_traffic() {
 		let dinfo = get_device_info(c.src_ip);
 		if (dinfo) {
 			if (!dev_stats[c.src_ip]) {
-				dev_stats[c.src_ip] = { ip: c.src_ip, name: dinfo.name, mac: dinfo.mac, icon: dinfo.icon, up_bps: 0, down_bps: 0, conn_count: 0, active: false };
+				dev_stats[c.src_ip] = { ip: c.src_ip, name: dinfo.name, mac: dinfo.mac, icon: dinfo.icon, online: !!arp_online[c.src_ip], up_bps: 0, down_bps: 0, conn_count: 0, active: false };
 			}
 			dev_stats[c.src_ip].up_bps += up_bps;
 			dev_stats[c.src_ip].down_bps += down_bps;
 			dev_stats[c.src_ip].conn_count += 1;
+			dev_stats[c.src_ip].online = true;
 			if (up_bps > 0 || down_bps > 0) dev_stats[c.src_ip].active = true;
 		}
 	}
@@ -955,7 +1259,7 @@ function sample_traffic() {
 		}
 	}
 
-	// Format devices array sorted by active speed then historical traffic
+	// Format devices array sorted by active speed then online status then historical traffic
 	let devices_arr = [];
 	let active_dev_count = 0;
 	for (let ip, ds in dev_stats) {
@@ -967,12 +1271,17 @@ function sample_traffic() {
 				break;
 			}
 		}
-		if (ds.conn_count == 0 && !has_hist && ip != "192.168.8.245" && ip != "192.168.8.208") continue;
+		if (ds.conn_count == 0 && !has_hist && !ds.online) continue;
 		if (ds.up_bps > 0 || ds.down_bps > 0) active_dev_count += 1;
 		push(devices_arr, ds);
 	}
 	sort(devices_arr, function(a, b) {
-		return ((b.up_bps + b.down_bps) - (a.up_bps + a.down_bps)) || (b.conn_count - a.conn_count);
+		let spd = (b.up_bps + b.down_bps) - (a.up_bps + a.down_bps);
+		if (spd != 0) return spd;
+		if (b.conn_count != a.conn_count) return b.conn_count - a.conn_count;
+		let a_on = a.online ? 1 : 0;
+		let b_on = b.online ? 1 : 0;
+		return b_on - a_on;
 	});
 
 	// Format groups array sorted by active speed then order

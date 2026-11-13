@@ -126,12 +126,12 @@
 		(data.devices || []).forEach(d => {
 			const selClass = selectedDeviceIp === d.ip ? "selected" : "";
 			devHtml += `
-				<div class="nn-node-card ${selClass}" data-device-ip="${esc(d.ip)}">
+				<div class="nn-node-card ${selClass}" data-device-ip="${esc(d.ip)}" title="IP: ${esc(d.ip)}${d.mac ? ' · MAC: ' + esc(d.mac) : ''}（双击名称可重命名）">
 					<div class="nn-node-left">
 						<div class="nn-icon-box">${deviceIconSvg(d.icon)}</div>
 						<div class="nn-node-info">
 							<div class="nn-node-name-row">
-								<span class="nn-node-name">${esc(d.name)}</span>
+								<span class="nn-node-name" data-rename-ip="${esc(d.ip)}" data-current-name="${esc(d.name)}">${esc(d.name)}</span>
 							</div>
 						</div>
 					</div>
@@ -148,6 +148,17 @@
 				const ip = el.getAttribute("data-device-ip");
 				selectedDeviceIp = (selectedDeviceIp === ip) ? null : ip;
 				renderOverview(latestOverview);
+			});
+			el.addEventListener("dblclick", async (ev) => {
+				ev.stopPropagation();
+				const ip = el.getAttribute("data-device-ip");
+				const nameEl = el.querySelector("[data-current-name]");
+				const curName = nameEl ? nameEl.getAttribute("data-current-name") : "";
+				const nextName = window.prompt(`为设备 (${ip}) 设置显示名称：`, curName);
+				if (nextName && nextName.trim() && nextName.trim() !== curName) {
+					await fetch(`${API_URL}?action=rename_device&ip=${encodeURIComponent(ip)}&name=${encodeURIComponent(nextName.trim())}`);
+					await pollOverview();
+				}
 			});
 		});
 

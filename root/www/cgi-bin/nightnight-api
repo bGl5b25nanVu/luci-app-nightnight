@@ -383,7 +383,7 @@ function seed_tweet_case_study(hist) {
 			"2026-11-10-11": 11000000
 		},
 		devices: {
-			"192.168.8.245": { ip: "192.168.8.245", up: 25927628, down: 454688, conn_count: 2, max_single_up: 22020096, night_up: 0, idle_up: 0, last_seen: now - 3600 },
+			"192.168.8.192": { ip: "192.168.8.192", up: 25927628, down: 454688, conn_count: 2, max_single_up: 22020096, night_up: 0, idle_up: 0, last_seen: now - 3600 },
 			"192.168.8.208": { ip: "192.168.8.208", up: 20000000, down: 300000, conn_count: 1, max_single_up: 20000000, night_up: 0, idle_up: 0, last_seen: now - 7200 }
 		}
 	};
@@ -411,7 +411,7 @@ function seed_tweet_case_study(hist) {
 		},
 		big_hours: {},
 		devices: {
-			"192.168.8.245": { ip: "192.168.8.245", up: 4388608, down: 987436, conn_count: 112, max_single_up: 187392, night_up: 0, idle_up: 0, last_seen: now - 1800 },
+			"192.168.8.192": { ip: "192.168.8.192", up: 4388608, down: 987436, conn_count: 112, max_single_up: 187392, night_up: 0, idle_up: 0, last_seen: now - 1800 },
 			"192.168.8.208": { ip: "192.168.8.208", up: 4000000, down: 900000, conn_count: 112, max_single_up: 180000, night_up: 184320, idle_up: 184320, last_seen: now - 3600 }
 		}
 	};
@@ -657,6 +657,34 @@ if (action == "suspicious") {
 		count: length(list),
 		items: slice(list, 0, 50)
 	}));
+	exit(0);
+}
+
+if (action == "rename_device") {
+	let ip = trim(params.ip || "");
+	let name = trim(params.name || "");
+	let icon = trim(params.icon || "");
+	if (!ip || !name) {
+		print(sprintf("%J\n", { ok: false, error: "Missing ip or name" }));
+		exit(0);
+	}
+	if (!icon) {
+		let ln = lc(name);
+		icon = (index(ln, "mac") >= 0 || index(ln, "pc") >= 0 || index(ln, "laptop") >= 0 || index(ln, "desktop") >= 0 || index(ln, "book") >= 0) ? "laptop" : "phone";
+	}
+	custom_devs[ip] = { name: name, icon: icon, user_set: true };
+	if (live && type(live.devices) == "array") {
+		for (let d in live.devices) {
+			if (d.ip == ip) {
+				d.name = name;
+				d.icon = icon;
+				if (d.mac) custom_devs[lc(d.mac)] = { name: name, icon: icon, user_set: true };
+			}
+		}
+		save_json(LIVE_FILE, live);
+	}
+	save_json(DEVICES_ETC_FILE, custom_devs);
+	print(sprintf("%J\n", { ok: true, ip: ip, name: name, icon: icon }));
 	exit(0);
 }
 
